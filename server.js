@@ -61,8 +61,8 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Auth routes — register, login, /me
-app.use('/api/v1/auth', require('./auth'));
+// Auth routes — register, login, /auth'th'
+app.use('/api/v1/auth', require('./wareleware_auth'));
 
 // ── 404 handler — catches any unmatched route ─────────────────────────────────
 app.use((req, res) => {
@@ -78,7 +78,7 @@ app.use((req, res) => {
 app.use((err, req, res, next) => {
   console.error('[Server] Unhandled error:', err.name, err.message);
   res.status(err.status || 500).json({
-    success: false,
+  success: false,
     message: process.env.NODE_ENV === 'production'
       ? 'An unexpected error occurred.'
       : err.message,
