@@ -62,7 +62,7 @@ app.get('/health', (req, res) => {
 });
 
 // Auth routes — register, login, /me
-app.use('/api/v1/auth', require('./routes/auth'));
+app.use('/api/v1/auth', require('./auth'));
 
 // ── 404 handler — catches any unmatched route ─────────────────────────────────
 app.use((req, res) => {
