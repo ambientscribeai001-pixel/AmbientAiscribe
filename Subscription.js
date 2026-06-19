@@ -16,9 +16,9 @@ const PLANS = {
   pro: {
     name:           'Clinical Pro',
     priceMonthly:   300,    // $300/month
-    priceAnnual:    2880,   // $240/month billed annually (20% off)
+    priceAnnual:    2880,   // $300/month billed annually
     notesPerMonth:  Infinity,
-    trialDays:      3,      // 3-day free trial
+    trialDays:      3,      // 1-day free trial
     features:       [
       'Unlimited notes',
       'Full 5-pass AI pipeline',
@@ -38,7 +38,7 @@ const PLANS = {
   clinic: {
     name:           'Clinic',
     priceMonthly:   400,    // $400/month — per provider, billed at clinic level
-    priceAnnual:    3840,   // $320/month billed annually
+    priceAnnual:    3840,   // $400/month billed annually
     notesPerMonth:  Infinity,
     trialDays:      3,
     features:       [
@@ -92,7 +92,7 @@ const SubscriptionSchema = new mongoose.Schema(
     },
 
     // ── Status ────────────────────────────────────────────────────────────
-    // trialing  → within 3-day free trial (Pro/Clinic/Enterprise)
+    // trialing  → within 1-day free trial (Pro/Clinic/Enterprise)
     // active    → paid and within billing period
     // past_due  → payment failed, 3-day grace period
     // cancelled → user cancelled, access until currentPeriodEnd
