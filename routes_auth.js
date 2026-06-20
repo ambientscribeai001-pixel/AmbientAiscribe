@@ -5,12 +5,12 @@
 const express    = require('express');
 const jwt        = require('jsonwebtoken');
 const rateLimit  = require('express-rate-limit');
-const User       = require('../models/User');
+const User       = require('../models_User');
 const {
   protect,
   recordFailedAttempt,
   resetLoginAttempts,
-}                = require('../middleware/auth');
+}                = require('./middleware/auth');
 
 const router = express.Router();
 
