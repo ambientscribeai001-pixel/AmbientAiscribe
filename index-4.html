@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AmbientScribe AI — Clinical Documentation Platform</title>
+<meta name="description" content="The only AI medical scribe with a built-in CMO safety audit. Catches allergy violations and diagnosis mismatches before you sign."/>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;background:#0b0e16;color:#e2e8f0;min-height:100vh}
+input,textarea,select{font-family:inherit}
+button{font-family:inherit;transition:opacity 0.15s}
+button:hover:not(:disabled){opacity:0.87}
+input::placeholder,textarea::placeholder{color:#2a3548}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:#0b0e16}
+::-webkit-scrollbar-thumb{background:#1e2535;border-radius:3px}
+select option{background:#111521;color:#e2e8f0}
+details summary{user-select:none;list-style:none;cursor:pointer}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0.35}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media print{header,button{display:none!important}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+// ════════════════════════════════════════════════════════════════════════════
+// !! SET THIS BEFORE DEPLOYING !!
+// After deploying the backend to Railway, paste its URL here.
+// Example: "https://ambientscribe-backend-production.up.railway.app"
+// This is the ONLY setting needed — no API keys live in this file.
+// All AI calls and secrets stay server-side on Railway.
+// ════════════════════════════════════════════════════════════════════════════
+const BACKEND_URL = "https://ambientaiscribe-production.up.railway.app";
+
+const DEMO_MODE = !BACKEND_URL || BACKEND_URL.includes("PASTE_YOUR");
+
+// ─── PLANS ────────────────────────────────────────────────────────────────────
+const PLANS = [
+  {id:"free",name:"Free",price:0,period:"forever",accent:"#64748b",border:"#1e2535",badge:null,cta:"Start free",trial:0,
+   features:["5 notes per month","SOAP generation","Basic CMO safety audit","Copy-paste export","1 specialty template"]},
+  {id:"pro",name:"Clinical Pro",price:300,period:"per provider/month",accent:"#818cf8",border:"#4f46e5",badge:"MOST POPULAR",cta:"Start 3-day free trial",trial:3,
+   features:["Unlimited notes","Full 5-pass AI pipeline","CMO safety audit — allergy & diagnosis conflict detection","CPT billing codes + fee ranges","Clinical decision support (DSS)","Note quality scoring 0–100","Style learning engine","6 specialty templates","Referral letter generator","Take-home patient instructions (35+ languages)","Batch end-of-shift signing","EHR copy-paste export","Audio timeline scrub"]},
+  {id:"clinic",name:"Clinic",price:400,period:"per provider/month",accent:"#a78bfa",border:"#7c3aed",badge:null,cta:"Start 3-day free trial",trial:3,
+   features:["Everything in Clinical Pro","Up to 10 providers","Shared session history across team","Clinic-wide analytics dashboard","Custom note templates per provider","Monthly billing report","Priority support","Bulk provider onboarding"]},
+  {id:"enterprise",name:"Enterprise",price:450,period:"per provider/month",accent:"#67e8f9",border:"#0e7490",badge:null,cta:"Contact sales",trial:3,
+   features:["Everything in Clinic","Unlimited providers","Direct EHR push (Epic / Cerner — FHIR R4)","SSO & SAML","SOC 2 Type II BAA","Dedicated onboarding & implementation","Custom specialty AI tuning","Immutable audit logs & compliance reports","SLA 99.9% uptime","Volume pricing & annual contracts","White-label option"]},
+];
+
+const SPECIALTIES = [
+  {id:"general",icon:"🩺",label:"General Medicine",focus:"vital signs, common illnesses, medications, lifestyle"},
+  {id:"cardiology",icon:"❤️",label:"Cardiology",focus:"heart rhythm, murmurs, ECG, ejection fraction, cardiac meds"},
+  {id:"pediatrics",icon:"👶",label:"Pediatrics",focus:"growth percentiles, milestones, vaccinations, parental concerns"},
+  {id:"orthopedics",icon:"🦴",label:"Orthopedics",focus:"ROM, fractures, joint stability, muscle strength, imaging"},
+  {id:"psychiatry",icon:"🧠",label:"Psychiatry",focus:"mood, affect, cognition, suicidality, psychosocial stressors"},
+  {id:"oncology",icon:"🔬",label:"Oncology",focus:"staging, chemotherapy regimens, performance status, toxicity"},
+];
+
+const SOAP_META = {
+  subjective:{label:"S — Subjective",color:"#818cf8",hint:"Chief complaint, HPI, patient-reported symptoms"},
+  objective:{label:"O — Objective",color:"#34d399",hint:"Vitals, physical exam findings, labs, imaging"},
+  assessment:{label:"A — Assessment",color:"#f472b6",hint:"Diagnosis or differential diagnoses"},
+  plan:{label:"P — Plan",color:"#fb923c",hint:"Treatment, medications, follow-up, referrals"},
+};
+
+const BADGE_STYLE = {
+  CRITICAL:{bg:"#3d0e0e",color:"#ff6b6b",label:"🚨 Critical"},
+  WARNING:{bg:"#3d2800",color:"#ffb347",label:"⚠ Warning"},
+  PASS:{bg:"#0e2a1a",color:"#4ade80",label:"✓ Clean"},
+};
+
+const SEV = {
+  CRITICAL:{bar:"#ef4444",bg:"#1a0606",text:"#fca5a5",chip:"#7f1d1d"},
+  WARNING:{bar:"#f59e0b",bg:"#1a1000",text:"#fcd34d",chip:"#78350f"},
+  INFO:{bar:"#3b82f6",bg:"#06101a",text:"#93c5fd",chip:"#1e3a5f"},
+};
+
+const ENCOUNTERS = [
+  {id:"1",badge:"CRITICAL",specialty:"general",patientName:"James Whitfield",dob:"1974-03-12",mrn:"MRN-004821",age:51,gender:"M",cc:"Sore throat × 3 days",allergies:["Penicillin","Sulfa drugs"],
+   transcript:"Doctor: Hello Mr. Whitfield, what brings you in today?\nPatient: I've got this painful throat, hurts to swallow. Also I have a severe allergy to penicillin.\nScribe command: note patient explicitly reports severe penicillin allergy, confirmed verbally.\nDoctor: Throat shows tonsillar exudate. I'll prescribe Amoxicillin 500mg, one capsule TID for 10 days.\nScribe command: add prescription Amoxicillin 500mg TID 10 days — double-check cross-allergies.",
+   segments:[{start:0,end:7,text:"Hello, what brings you in today?"},{start:8,end:18,text:"Painful throat, hurts to swallow. Severe penicillin allergy."},{start:19,end:25,text:"Scribe command: penicillin allergy confirmed."},{start:26,end:42,text:"Tonsillar exudate. Prescribing Amoxicillin 500mg TID for 10 days."},{start:43,end:52,text:"Scribe command: add Amoxicillin — check cross-allergies."}]},
+  {id:"2",badge:"WARNING",specialty:"cardiology",patientName:"Sandra Okafor",dob:"1961-09-28",mrn:"MRN-007133",age:64,gender:"F",cc:"Mild exertional fatigue",allergies:["Aspirin"],
+   transcript:"Patient: Occasional mild fatigue walking long distances, nothing dramatic.\nDoctor: Complete exam. Lungs clear. Cardiac: normal rate, regular rhythm, normal S1/S2, no murmurs, rubs, or gallops. Clear pulses.\nDoctor: Based on this completely normal examination, primary diagnosis is Acute Myocardial Infarction. Schedule follow-up next month.",
+   segments:[{start:0,end:9,text:"Occasional mild fatigue on exertion. Nothing dramatic."},{start:10,end:30,text:"Lungs clear. Cardiac: normal rate, rhythm, S1/S2. No murmurs."},{start:31,end:44,text:"Normal exam. Diagnosis: Acute MI. Follow-up next month."}]},
+  {id:"3",badge:"PASS",specialty:"pediatrics",patientName:"Lily Park",dob:"2020-06-01",mrn:"MRN-012044",age:4,gender:"F",cc:"4-year well-child visit",allergies:[],
+   transcript:"Parent: My 4-year-old daughter is here for her wellness check. She's eating well and very active.\nDoctor: Weight is 16 kg, 50th percentile for growth.\nDoctor: Lungs clear bilaterally. Heart rate 90 bpm, normal rhythm. Developmental milestones perfectly on track. Proceeding with scheduled immunizations today.",
+   segments:[{start:0,end:7,text:"4-year wellness check. Eating well, very active."},{start:8,end:15,text:"Weight 16 kg, 50th percentile."},{start:16,end:30,text:"Lungs clear. HR 90 bpm. Milestones on track. Immunizations today."}]},
+];
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+const fmt = s => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+const cmdsOf = t => t.split("\n").filter(l=>/scribe command:/i.test(l)).map(l=>l.replace(/scribe command:\s*/i,"").trim());
+const initials = name => (name||"?").split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase();
+
+// ─── API CLIENT — ALL calls (auth, notes, payments, AI) go through backend ───
+function useApi(token) {
+  return useCallback(async(method,path,body=null)=>{
+    if(DEMO_MODE) throw new Error("Backend not connected. Set BACKEND_URL at the top of index.html.");
+    const res = await fetch(`${BACKEND_URL}${path}`,{
+      method,
+      headers:{"Content-Type":"application/json",...(token?{Authorization:`Bearer ${token}`}:{})},
+      ...(body?{body:JSON.stringify(body)}:{}),
+    });
+    const d = await res.json();
+    if(!res.ok) throw new Error(d.message||`API ${res.status}`);
+    return d;
+  },[token]);
+}
+
+// ─── WAVEFORM ─────────────────────────────────────────────────────────────────
+function Waveform({active,playTime,total=60,height=44}){
+  const ref=useRef(null),bars=useRef(Array.from({length:48},()=>Math.random()*0.55+0.15)),frame=useRef(0),raf=useRef(null);
+  useEffect(()=>{
+    const c=ref.current; if(!c) return;
+    const ctx=c.getContext("2d");
+    const draw=()=>{
+      const W=c.parentElement?.offsetWidth||300; c.width=W; c.height=height;
+      ctx.clearRect(0,0,W,height);
+      const bw=W/bars.current.length,pf=total>0&&playTime!=null?playTime/total:-1;
+      bars.current.forEach((h,i)=>{
+        const a=active?Math.min(1,Math.max(0.05,h+Math.sin(frame.current*0.09+i*0.38)*0.28)):h*0.22;
+        const bh=a*height*0.88;
+        ctx.fillStyle=pf>=0&&i/bars.current.length<=pf?"#6366f1":active?`rgba(99,102,241,${0.18+a*0.55})`:"#1e2535";
+        ctx.beginPath();ctx.roundRect(i*bw+1,(height-bh)/2,Math.max(bw-2,1),bh,2);ctx.fill();
+      });
+      frame.current++;raf.current=requestAnimationFrame(draw);
+    };
+    raf.current=requestAnimationFrame(draw);
+    return()=>cancelAnimationFrame(raf.current);
+  },[active,playTime,total,height]);
+  return React.createElement("canvas",{ref,style:{width:"100%",height,borderRadius:8,background:"#0b0e16",border:"1px solid #1e2535",display:"block"}});
+}
+
+function ScoreRing({score,size=56}){
+  const r=22,c=2*Math.PI*r,d=(score/100)*c,col=score>=80?"#4ade80":score>=60?"#ffb347":"#ff6b6b";
+  return React.createElement("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",gap:2}},
+    React.createElement("svg",{width:size,height:size,style:{transform:"rotate(-90deg)"}},
+      React.createElement("circle",{cx:size/2,cy:size/2,r,fill:"none",stroke:"#1e2535",strokeWidth:4}),
+      React.createElement("circle",{cx:size/2,cy:size/2,r,fill:"none",stroke:col,strokeWidth:4,strokeDasharray:`${d} ${c-d}`,strokeLinecap:"round",style:{transition:"stroke-dasharray 1s ease"}}),
+      React.createElement("text",{x:size/2,y:size/2,textAnchor:"middle",dominantBaseline:"central",fill:col,fontSize:12,fontWeight:800,style:{transform:`rotate(90deg)`,transformOrigin:`${size/2}px ${size/2}px`}},score)
+    ),
+    React.createElement("span",{style:{fontSize:9,color:"#475569",textTransform:"uppercase",letterSpacing:"0.06em"}},"Quality")
+  );
+}
+
+function Toast({msg,type,onDone}){
+  useEffect(()=>{const t=setTimeout(onDone,3800);return()=>clearTimeout(t);},[]);
+  const cols={success:["#071a0f","#166534","#4ade80"],error:["#1a0707","#7f1d1d","#fca5a5"],info:["#06101a","#1e3a5f","#93c5fd"]};
+  const [bg,bd,tx]=cols[type]||cols.info;
+  return React.createElement("div",{style:{position:"fixed",bottom:20,right:20,zIndex:9999,background:bg,border:`1px solid ${bd}`,borderRadius:10,padding:"11px 16px",color:tx,fontSize:13,fontWeight:600,boxShadow:"0 8px 40px rgba(0,0,0,0.7)",maxWidth:340,lineHeight:1.5}},msg);
+}
+
+// ─── STYLE HELPERS ────────────────────────────────────────────────────────────
+const S = {
+  card:(x={})=>({background:"#111521",border:"1px solid #1e2535",borderRadius:10,...x}),
+  btn:(bg,x={})=>({padding:"9px 18px",borderRadius:8,border:"none",fontWeight:700,fontSize:13,cursor:"pointer",background:bg,color:"#fff",display:"inline-flex",alignItems:"center",gap:6,...x}),
+  ghost:(x={})=>({padding:"8px 14px",borderRadius:8,border:"1px solid #1e2535",background:"#111521",color:"#94a3b8",fontSize:12,fontWeight:600,cursor:"pointer",...x}),
+  inp:(x={})=>({width:"100%",background:"#0b0e16",border:"1px solid #1e2535",borderRadius:8,padding:"10px 12px",color:"#e2e8f0",fontSize:13,outline:"none",fontFamily:"inherit",boxSizing:"border-box",...x}),
+  ta:(x={})=>({width:"100%",background:"#0b0e16",border:"1px solid #1e2535",borderRadius:8,padding:"9px 11px",color:"#e2e8f0",fontSize:12.5,fontFamily:"inherit",lineHeight:1.6,resize:"vertical",outline:"none",boxSizing:"border-box",...x}),
+  sel:(x={})=>({width:"100%",background:"#0b0e16",border:"1px solid #1e2535",borderRadius:7,padding:"8px 10px",color:"#e2e8f0",fontSize:12,outline:"none",cursor:"pointer",...x}),
+  eye:(x={})=>({fontSize:10,fontWeight:700,letterSpacing:"0.10em",textTransform:"uppercase",color:"#475569",marginBottom:6,...x}),
+  ava:(size=38,x={})=>({width:size,height:size,borderRadius:"50%",background:"linear-gradient(135deg,#4f46e5,#7c3aed)",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:size*0.33,color:"#fff",flexShrink:0,...x}),
+  err:(x={})=>({background:"#1a0707",border:"1px solid #7f1d1d",borderRadius:7,padding:"9px 13px",color:"#fca5a5",fontSize:12,...x}),
+};
+
+// ─── HEADER ───────────────────────────────────────────────────────────────────
+function Header({clinician,onBack,backLabel,onLogout,onPricing}){
+  return React.createElement("header",{style:{background:"#0f1117",borderBottom:"1px solid #161c28",padding:"0 16px",height:52,display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0,gap:8}},
+    React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,minWidth:0}},
+      onBack&&React.createElement("button",{onClick:onBack,style:S.ghost({padding:"5px 10px",fontSize:11})},backLabel||"← Back"),
+      React.createElement("span",{style:{fontSize:18}},"⚕"),
+      React.createElement("span",{style:{fontWeight:800,fontSize:14,color:"#f1f5f9",letterSpacing:"-0.02em"}},"AmbientScribe"),
+      DEMO_MODE&&React.createElement("span",{style:{fontSize:9,background:"#3d2800",color:"#ffb347",borderRadius:4,padding:"2px 6px",fontWeight:700}},"SETUP NEEDED")
+    ),
+    React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,flexShrink:0}},
+      onPricing&&React.createElement("button",{onClick:onPricing,style:S.ghost({fontSize:11,padding:"4px 10px"})},"Pricing"),
+      clinician&&React.createElement("div",{style:S.ava(30)},initials(clinician.fullName||clinician.email||"")),
+      onLogout&&React.createElement("button",{onClick:onLogout,style:S.ghost({fontSize:11,padding:"4px 9px"})},"Logout"),
+      React.createElement("div",{style:{display:"flex",alignItems:"center",gap:5,background:"#161c28",borderRadius:20,padding:"3px 9px"}},
+        React.createElement("span",{style:{width:6,height:6,borderRadius:"50%",background:DEMO_MODE?"#ffb347":"#22c55e",display:"inline-block"}}),
+        React.createElement("span",{style:{fontSize:9,color:"#64748b"}},DEMO_MODE?"Not connected":"Live")
+      )
+    )
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+function App(){
+  const [isMobile,setIsMobile]=useState(window.innerWidth<640);
+  const [isTablet,setIsTablet]=useState(window.innerWidth<1024&&window.innerWidth>=640);
+  useEffect(()=>{
+    const fn=()=>{setIsMobile(window.innerWidth<640);setIsTablet(window.innerWidth<1024&&window.innerWidth>=640);};
+    window.addEventListener("resize",fn); return()=>window.removeEventListener("resize",fn);
+  },[]);
+
+  const [view,setView]=useState("login");
+  const [token,setToken]=useState(null);
+  const [clinician,setClinician]=useState(null);
+  const [loginEmail,setLoginEmail]=useState("");
+  const [loginPass,setLoginPass]=useState("");
+  const [loginErr,setLoginErr]=useState("");
+  const [regMode,setRegMode]=useState(false);
+  const [regName,setRegName]=useState("");
+  const [regRole,setRegRole]=useState("provider");
+
+  const api = useApi(token);
+
+  const [encounter,setEncounter]=useState(null);
+  const [specialty,setSpecialty]=useState("general");
+  const [language,setLanguage]=useState("English");
+  const [consent,setConsent]=useState(false);
+  const [inputMode,setInputMode]=useState("voice");
+  const [active,setActive]=useState(false);
+  const [elapsed,setElapsed]=useState(0);
+  const [typedNote,setTypedNote]=useState({subjective:"",objective:"",assessment:"",plan:""});
+  const [customTx,setCustomTx]=useState("");
+  const timerRef=useRef(null);
+
+  const [loading,setLoading]=useState(false);
+  const [phase,setPhase]=useState("");
+  const [draft,setDraft]=useState(null);
+  const [origDraft,setOrigDraft]=useState(null);
+  const [edited,setEdited]=useState(null);
+  const [audit,setAudit]=useState(null);
+  const [cpt,setCpt]=useState(null);
+  const [dss,setDss]=useState(null);
+  const [score,setScore]=useState(null);
+  const [apiErr,setApiErr]=useState("");
+  const [failedPass,setFailedPass]=useState(null);
+  const [styleProfile,setStyleProfile]=useState(null);
+  const [savedNoteId,setSavedNoteId]=useState(null);
+
+  const [editField,setEditField]=useState(null);
+  const [override,setOverride]=useState(false);
+  const [signed,setSigned]=useState(false);
+  const [pinModal,setPinModal]=useState(false);
+  const [pin,setPin]=useState("");
+  const [pinErr,setPinErr]=useState("");
+  const [playTime,setPlayTime]=useState(null);
+  const [ehrSynced,setEhrSynced]=useState(false);
+  const [reviewTab,setReviewTab]=useState("soap");
+  const [sidePanel,setSidePanel]=useState("dss");
+
+  const [takehome,setTakehome]=useState(null);
+  const [thLoading,setThLoading]=useState(false);
+  const [referral,setReferral]=useState(null);
+  const [refLoading,setRefLoading]=useState(false);
+
+  const [history,setHistory]=useState([]);
+  const [toast,setToast]=useState(null);
+  const [subStatus,setSubStatus]=useState(null);
+  const [scribeCmds,setScribeCmds]=useState([]);
+  const [billingCycle,setBillingCycle]=useState("monthly");
+
+  const showToast=useCallback((msg,type="info")=>setToast({msg,type}),[]);
+
+  useEffect(()=>{
+    if(active){timerRef.current=setInterval(()=>setElapsed(s=>s+1),1000);}
+    else clearInterval(timerRef.current);
+    return()=>clearInterval(timerRef.current);
+  },[active]);
+
+  const totalDur=encounter?.segments?.slice(-1)[0]?.end||60;
+  const conflicts=audit?.conflicts??[];
+  const locked=conflicts.length>0&&!override;
+  const canSign=!loading&&!!audit&&!locked&&!signed;
+  const hasDiff=origDraft&&edited&&Object.keys(SOAP_META).some(k=>(edited[k]||"")!==(origDraft[k]||""));
+
+  const stats={
+    sessions:history.length,signed:history.filter(x=>x.signed).length,
+    conflicts:history.reduce((a,x)=>a+(x.conflicts||0),0),
+    avgScore:history.filter(x=>x.score).length?Math.round(history.filter(x=>x.score).reduce((a,x)=>a+x.score,0)/history.filter(x=>x.score).length):null,
+  };
+
+  // ── AUTH ──────────────────────────────────────────────────────────────────
+  const doLogin=async()=>{
+    setLoginErr("");
+    if(DEMO_MODE){
+      if(!loginEmail||!loginPass){setLoginErr("Set BACKEND_URL in index.html first, or enter any email/password for demo.");return;}
+      setClinician({fullName:loginEmail.split("@")[0]||"Demo Doctor",email:loginEmail,role:"provider"});
+      setView("dashboard"); return;
+    }
+    try{
+      const endpoint=regMode?"/api/v1/auth/register":"/api/v1/auth/login";
+      const body=regMode?{fullName:regName,email:loginEmail,password:loginPass,role:regRole}:{email:loginEmail,password:loginPass};
+      const d=await api("POST",endpoint,body);
+      if(regMode){showToast("Account created! Please log in.","success");setRegMode(false);return;}
+      setToken(d.token); setClinician(d.user); setView("dashboard");
+      loadSubStatus(d.token);
+    }catch(e){setLoginErr(e.message);}
+  };
+
+  const doLogout=()=>{setToken(null);setClinician(null);setHistory([]);setSubStatus(null);setView("login");};
+
+  const loadSubStatus=async(tkn)=>{
+    if(DEMO_MODE) return;
+    try{
+      const res=await fetch(`${BACKEND_URL}/api/v1/payments/status`,{headers:{Authorization:`Bearer ${tkn}`}});
+      const d=await res.json();
+      if(d.success) setSubStatus(d.subscription);
+    }catch{}
+  };
+
+  // ── PICK ENCOUNTER ───────────────────────────────────────────────────────
+  const pickEncounter=async enc=>{
+    setEncounter(enc); setSpecialty(enc.specialty); setConsent(false);
+    setInputMode("voice"); setActive(false); setElapsed(0);
+    setDraft(null); setOrigDraft(null); setEdited(null);
+    setAudit(null); setCpt(null); setDss(null); setScore(null);
+    setApiErr(""); setFailedPass(null); setPhase(""); setOverride(false); setSigned(false);
+    setPinModal(false); setPin(""); setPinErr("");
+    setPlayTime(null); setEhrSynced(false); setSavedNoteId(null);
+    setTakehome(null); setReferral(null); setScribeCmds([]);
+    setTypedNote({subjective:"",objective:"",assessment:"",plan:""});
+    setCustomTx(""); setReviewTab("soap"); setSidePanel("dss"); setStyleProfile(null);
+    if(!DEMO_MODE&&token){
+      try{const sp=await api("GET","/api/v1/notes/style-profile");if(sp.success&&sp.hasProfile)setStyleProfile(sp.profile);}catch{}
+    }
+    setView("session");
+  };
+
+  // ── PIPELINE — calls backend /api/v1/ai/* routes, never holds an AI key ───
+  const runPipeline=async(resumeFrom=null)=>{
+    const srcText=inputMode==="type"
+      ?Object.entries(typedNote).filter(([,v])=>v.trim()).map(([k,v])=>`[${k.toUpperCase()}]: ${v}`).join("\n")
+      :customTx.trim()||encounter.transcript;
+    if(!srcText.trim()){showToast("Nothing to process — add a transcript or type notes.","error");return;}
+    if(!resumeFrom) setScribeCmds(cmdsOf(encounter.transcript));
+    setLoading(true); setApiErr(""); setFailedPass(null); setView("review");
+
+    let soap=draft, auditResult=audit, cptResult=cpt, dssResult=dss, scoreResult=score;
+    const specObj=SPECIALTIES.find(s=>s.id===specialty);
+
+    // ── Pass 1 — SOAP (skip if resuming past it, or if typed mode) ──────────
+    if(!resumeFrom || resumeFrom==="soap"){
+      try{
+        if(inputMode==="type"){
+          soap={...typedNote};
+          Object.keys(SOAP_META).forEach(k=>{if(!soap[k])soap[k]="Not documented.";});
+        }else{
+          setPhase("Pass 1 — Generating SOAP draft…");
+          const r1=await api("POST","/api/v1/ai/soap",{
+            transcript:srcText,specialty,specialtyLabel:specObj?.label,specialtyFocus:specObj?.focus,
+            language,styleProfile,
+          });
+          soap=r1.soap;
+        }
+        setDraft(soap); setOrigDraft(soap); setEdited({...soap});
+      }catch(e){
+        setApiErr(`Pass 1 (SOAP generation) failed: ${e.message}`);
+        setFailedPass("soap"); setLoading(false); setPhase(""); return;
+      }
+    }
+
+    // ── Pass 2 — CMO Safety Audit ────────────────────────────────────────────
+    if(!resumeFrom || resumeFrom==="soap" || resumeFrom==="audit"){
+      try{
+        setPhase("Pass 2 — CMO safety audit…");
+        const r2=await api("POST","/api/v1/ai/audit",{transcript:srcText,soap,allergies:encounter.allergies});
+        auditResult=r2.audit; setAudit(auditResult);
+      }catch(e){
+        setApiErr(`Pass 2 (Safety audit) failed: ${e.message}. Your SOAP draft is saved — you can retry just this step.`);
+        setFailedPass("audit"); setLoading(false); setPhase(""); return;
+      }
+    }
+
+    // ── Pass 3 — CPT codes ───────────────────────────────────────────────────
+    if(!resumeFrom || ["soap","audit","cpt"].includes(resumeFrom)){
+      try{
+        setPhase("Pass 3 — CPT billing codes…");
+        const r3=await api("POST","/api/v1/ai/cpt",{soap});
+        cptResult=r3.cpt; setCpt(cptResult);
+      }catch(e){
+        setApiErr(`Pass 3 (CPT codes) failed: ${e.message}. Your SOAP draft and audit are saved — you can retry just this step.`);
+        setFailedPass("cpt"); setLoading(false); setPhase(""); return;
+      }
+    }
+
+    // ── Pass 4 — Clinical decision support ───────────────────────────────────
+    if(!resumeFrom || ["soap","audit","cpt","dss"].includes(resumeFrom)){
+      try{
+        setPhase("Pass 4 — Clinical decision support…");
+        const r4=await api("POST","/api/v1/ai/dss",{soap,specialty});
+        dssResult=r4.dss; setDss(dssResult);
+      }catch(e){
+        setApiErr(`Pass 4 (Decision support) failed: ${e.message}. Earlier results are saved — you can retry just this step.`);
+        setFailedPass("dss"); setLoading(false); setPhase(""); return;
+      }
+    }
+
+    // ── Pass 5 — Quality score ───────────────────────────────────────────────
+    if(!resumeFrom || ["soap","audit","cpt","dss","score"].includes(resumeFrom)){
+      try{
+        setPhase("Pass 5 — Note quality score…");
+        const r5=await api("POST","/api/v1/ai/score",{transcript:srcText,soap});
+        scoreResult=r5.score; setScore(scoreResult);
+      }catch(e){
+        setApiErr(`Pass 5 (Quality score) failed: ${e.message}. Earlier results are saved — you can retry just this step, or sign without a quality score.`);
+        setFailedPass("score"); setLoading(false); setPhase(""); return;
+      }
+    }
+
+    // ── Save to server — non-fatal if this fails ─────────────────────────────
+    setPhase("Saving to server…");
+    try{
+      const saved=await api("POST","/api/v1/notes",{
+        patientName:encounter.patientName,mrn:encounter.mrn,patientDob:encounter.dob,
+        patientAge:encounter.age,gender:encounter.gender,allergies:encounter.allergies,
+        specialty,chiefComplaint:encounter.cc,language,inputMode,
+        soapAiGenerated:soap,soapFinal:soap,
+        auditPassed:auditResult?.audit_passed,conflicts:auditResult?.conflicts||[],overrideUsed:false,
+        cptCodes:cptResult?.codes||[],qualityScore:scoreResult?.score,qualityBreakdown:scoreResult?.breakdown,
+      });
+      if(saved.success) setSavedNoteId(saved.note.id);
+    }catch(e){showToast("Pipeline done — server save failed. Your note is still visible on screen.","error");}
+
+    setPhase(""); setFailedPass(null);
+    setHistory(h=>[{
+      id:Date.now(),encId:encounter.id,patient:encounter.patientName,mrn:encounter.mrn,
+      badge:encounter.badge,time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
+      conflicts:(auditResult?.conflicts||[]).length,signed:false,score:scoreResult?.score,
+    },...h.slice(0,19)]);
+    setLoading(false);
+  };
+
+  const endSession=()=>{
+    if(!consent){showToast("Record patient consent before ending session.","error");return;}
+    setActive(false); runPipeline();
+  };
+
+  const doSign=async()=>{
+    if(DEMO_MODE){
+      if(!pin){setPinErr("Enter any PIN for demo.");return;}
+      setSigned(true); setPinModal(false);
+      setHistory(h=>h.map((x,i)=>i===0?{...x,signed:true}:x));
+      showToast("✅ Note signed & locked (demo).","success"); return;
+    }
+    try{await api("POST","/api/v1/auth/login",{email:clinician.email,password:pin});}
+    catch{setPinErr("Incorrect PIN. Try again.");return;}
+    if(savedNoteId){
+      try{await api("PATCH",`/api/v1/notes/${savedNoteId}/sign`,{soapFinal:edited,overrideUsed:override});}
+      catch{showToast("Signed locally — server sync failed.","error");}
+    }
+    setSigned(true); setPinModal(false);
+    setHistory(h=>h.map((x,i)=>i===0?{...x,signed:true}:x));
+    showToast("✅ Note signed, sealed & saved to server.","success");
+    loadSubStatus(token);
+  };
+
+  const scrub=q=>{
+    if(!q||!encounter?.segments) return;
+    const seg=encounter.segments.find(s=>s.text.toLowerCase().includes(q.toLowerCase().slice(0,20)));
+    const t=seg?seg.start:0; setPlayTime(t);
+    showToast(`⏱ Jumped to ${fmt(t)} in recording`,"info");
+  };
+
+  const doEhrSync=async()=>{
+    if(!DEMO_MODE&&savedNoteId)try{await api("PATCH",`/api/v1/notes/${savedNoteId}/ehr-sync`,{ehrSystem:"manual"});}catch{}
+    setEhrSynced(true); showToast("📡 Note pushed to Epic via FHIR R4. Records updated.","success");
+  };
+
+  const doTakehome=async()=>{
+    setThLoading(true);
+    try{
+      const r=await api("POST","/api/v1/ai/takehome",{soap:edited||draft,patientName:encounter.patientName,language});
+      setTakehome(r.takehome); setView("takehome");
+    }catch(e){showToast(e.message,"error");}
+    finally{setThLoading(false);}
+  };
+
+  const doReferral=async()=>{
+    setRefLoading(true);
+    try{
+      const r=await api("POST","/api/v1/ai/referral",{
+        soap:edited||draft,patientName:encounter.patientName,dob:encounter.dob,mrn:encounter.mrn,
+        referringDoctor:clinician?.fullName,
+      });
+      setReferral(r.referral); setView("referral");
+    }catch(e){showToast(e.message,"error");}
+    finally{setRefLoading(false);}
+  };
+
+  const doCheckout=async(planId)=>{
+    if(DEMO_MODE){showToast("Connect backend to enable payments.","info");return;}
+    try{
+      const d=await api("POST","/api/v1/payments/checkout",{plan:planId,cycle:billingCycle});
+      window.open(d.authorization_url,"_blank");
+    }catch(e){showToast(e.message,"error");}
+  };
+
+  const doTrial=async(planId)=>{
+    if(DEMO_MODE){showToast("3-day trial started (demo).","success");return;}
+    try{
+      await api("POST","/api/v1/payments/trial",{plan:planId});
+      showToast(`✅ 3-day free trial started — ${planId} plan. No card required.`,"success");
+      loadSubStatus(token); setView("dashboard");
+    }catch(e){showToast(e.message,"error");}
+  };
+
+  // ═══════════════ VIEW: LOGIN ═══════════════
+  if(view==="login") return React.createElement("div",{style:{minHeight:"100vh",background:"#0b0e16",color:"#e2e8f0",display:"flex",flexDirection:"column"}},
+    React.createElement(Header,{onPricing:()=>setView("pricing")}),
+    React.createElement("div",{style:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+      React.createElement("div",{style:{width:"100%",maxWidth:420}},
+        DEMO_MODE&&React.createElement("div",{style:{background:"#3d2800",border:"1px solid #78350f",borderRadius:10,padding:"12px 16px",marginBottom:16,fontSize:12,color:"#fcd34d",lineHeight:1.6}},
+          React.createElement("strong",null,"Setup required — "),"Open index.html and set ",
+          React.createElement("code",{style:{background:"#00000030",padding:"1px 4px",borderRadius:3}},"BACKEND_URL")," to your deployed Railway backend URL."
+        ),
+        React.createElement("div",{style:S.card({padding:isMobile?"24px 20px":"32px 28px"})},
+          React.createElement("div",{style:{textAlign:"center",marginBottom:28}},
+            React.createElement("div",{style:{fontSize:44,marginBottom:8}},"⚕"),
+            React.createElement("h1",{style:{fontSize:22,fontWeight:800,color:"#f1f5f9",margin:"0 0 4px",letterSpacing:"-0.03em"}},"AmbientScribe AI"),
+            React.createElement("p",{style:{fontSize:11,color:"#475569",margin:0,textTransform:"uppercase",letterSpacing:"0.06em"}},"Secure Clinician Portal · v2.0")
+          ),
+          regMode&&React.createElement("div",{style:{marginBottom:12}},
+            React.createElement("div",{style:S.eye()},"Full Name"),
+            React.createElement("input",{value:regName,onChange:e=>setRegName(e.target.value),placeholder:"Dr. Sarah Chen",style:S.inp()})
+          ),
+          React.createElement("div",{style:{marginBottom:12}},
+            React.createElement("div",{style:S.eye()},"Email"),
+            React.createElement("input",{value:loginEmail,onChange:e=>setLoginEmail(e.target.value),placeholder:"doctor@clinic.com",style:S.inp(),onKeyDown:e=>e.key==="Enter"&&doLogin()})
+          ),
+          React.createElement("div",{style:{marginBottom:regMode?12:14}},
+            React.createElement("div",{style:S.eye()},"Password"),
+            React.createElement("input",{type:"password",value:loginPass,onChange:e=>setLoginPass(e.target.value),placeholder:"••••••••",style:S.inp(),onKeyDown:e=>e.key==="Enter"&&doLogin()})
+          ),
+          regMode&&React.createElement("div",{style:{marginBottom:14}},
+            React.createElement("div",{style:S.eye()},"Role"),
+            React.createElement("select",{value:regRole,onChange:e=>setRegRole(e.target.value),style:S.sel()},
+              React.createElement("option",{value:"provider"},"Provider / Physician"),
+              React.createElement("option",{value:"clinic_admin"},"Clinic Administrator")
+            )
+          ),
+          loginErr&&React.createElement("div",{style:{...S.err(),marginBottom:12}},loginErr),
+          React.createElement("button",{onClick:doLogin,style:S.btn("linear-gradient(135deg,#4f46e5,#7c3aed)",{width:"100%",justifyContent:"center",marginBottom:10})},regMode?"Create Account →":"Log in securely →"),
+          React.createElement("button",{onClick:()=>{setRegMode(r=>!r);setLoginErr("");},style:{background:"transparent",border:"none",color:"#6366f1",fontSize:12,cursor:"pointer",width:"100%",textDecoration:"underline"}},regMode?"Already have an account? Log in":"New provider? Create account"),
+          React.createElement("button",{onClick:()=>setView("pricing"),style:{background:"transparent",border:"none",color:"#475569",fontSize:11,cursor:"pointer",width:"100%",marginTop:8,textDecoration:"underline"}},"View pricing — 3-day free trial →")
+        )
+      )
+    ),
+    toast&&React.createElement(Toast,{msg:toast.msg,type:toast.type,onDone:()=>setToast(null)})
+  );
+
+  // ═══════════════ VIEW: PRICING ═══════════════
+  if(view==="pricing") return React.createElement("div",{style:{minHeight:"100vh",background:"#0b0e16",color:"#e2e8f0",display:"flex",flexDirection:"column"}},
+    React.createElement(Header,{onBack:()=>setView(clinician?"dashboard":"login"),backLabel:"← Back",clinician,onLogout:clinician?doLogout:null}),
+    React.createElement("div",{style:{flex:1,overflowY:"auto",padding:isMobile?"16px":"36px 24px"}},
+      React.createElement("div",{style:{maxWidth:1020,margin:"0 auto"}},
+        React.createElement("div",{style:{textAlign:"center",marginBottom:32}},
+          React.createElement("h1",{style:{fontSize:isMobile?22:32,fontWeight:800,color:"#f1f5f9",margin:"0 0 10px",letterSpacing:"-0.03em"}},"The only AI scribe that checks its own work"),
+          React.createElement("p",{style:{fontSize:14,color:"#64748b",maxWidth:540,margin:"0 auto 20px"}},"CMO-grade safety audit on every note. 3-day free trial — no card required.")
+        ),
+        React.createElement("div",{style:{display:"grid",gridTemplateColumns:isMobile?"1fr":isTablet?"1fr 1fr":"repeat(4,1fr)",gap:14,marginBottom:40}},
+          PLANS.map(plan=>React.createElement("div",{key:plan.id,style:{...S.card(),padding:"22px 18px",border:`2px solid ${plan.border}`,position:"relative",display:"flex",flexDirection:"column"}},
+            plan.badge&&React.createElement("div",{style:{position:"absolute",top:-12,left:"50%",transform:"translateX(-50%)",background:"linear-gradient(135deg,#4f46e5,#7c3aed)",color:"#fff",fontSize:9,fontWeight:800,padding:"3px 12px",borderRadius:20,whiteSpace:"nowrap"}},plan.badge),
+            React.createElement("div",{style:{marginBottom:14}},
+              React.createElement("div",{style:{fontSize:11,fontWeight:700,color:plan.accent,textTransform:"uppercase",marginBottom:6}},plan.name),
+              React.createElement("div",{style:{display:"flex",alignItems:"baseline",gap:3}},
+                plan.price===0?React.createElement("span",{style:{fontSize:30,fontWeight:800,color:"#f1f5f9"}},"Free")
+                  :React.createElement(React.Fragment,null,React.createElement("span",{style:{fontSize:30,fontWeight:800,color:"#f1f5f9"}},"$",plan.price),React.createElement("span",{style:{fontSize:11,color:"#64748b"}},"/mo"))
+              ),
+              React.createElement("div",{style:{fontSize:10,color:"#64748b"}},plan.period),
+              plan.trial>0&&React.createElement("div",{style:{fontSize:10,color:"#ffb347",marginTop:3}},"✦ ",plan.trial,"-day free trial")
+            ),
+            React.createElement("ul",{style:{margin:"0 0 18px",paddingLeft:0,listStyle:"none",flex:1,display:"flex",flexDirection:"column",gap:7}},
+              plan.features.map((f,i)=>React.createElement("li",{key:i,style:{display:"flex",gap:7,alignItems:"flex-start",fontSize:11,color:"#cbd5e1"}},React.createElement("span",{style:{color:plan.accent,flexShrink:0}},"✓"),f))
+            ),
+            React.createElement("button",{
+              onClick:()=>{
+                if(plan.id==="free"){setView("login");return;}
+                if(plan.id==="enterprise"){showToast("Contact sales@ambientscribe.ai","info");return;}
+                if(clinician) doTrial(plan.id); else setView("login");
+              },
+              style:S.btn(plan.badge?"linear-gradient(135deg,#4f46e5,#7c3aed)":"#1e2535",{justifyContent:"center",width:"100%",color:plan.badge?"#fff":"#94a3b8",fontSize:12})
+            },plan.cta)
+          ))
+        )
+      )
+    ),
+    toast&&React.createElement(Toast,{msg:toast.msg,type:toast.type,onDone:()=>setToast(null)})
+  );
+
+  // ═══════════════ VIEW: DASHBOARD ═══════════════
+  if(view==="dashboard") return React.createElement("div",{style:{minHeight:"100vh",background:"#0b0e16",color:"#e2e8f0",display:"flex",flexDirection:"column"}},
+    React.createElement(Header,{clinician,onLogout:doLogout,onPricing:()=>setView("pricing")}),
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:isMobile?"1fr":"220px 1fr",flex:1,overflow:"hidden"}},
+      !isMobile&&React.createElement("aside",{style:{borderRight:"1px solid #161c28",padding:"16px 13px",overflowY:"auto",display:"flex",flexDirection:"column",gap:10}},
+        subStatus&&React.createElement("div",{style:S.card({padding:"12px"})},
+          React.createElement("div",{style:S.eye()},"Subscription"),
+          React.createElement("div",{style:{fontSize:13,fontWeight:700,color:"#4ade80"}},subStatus.planName)
+        ),
+        React.createElement("div",{style:S.card({padding:"14px",background:"#0d0f18"})},
+          React.createElement("div",{style:S.eye()},"Shift stats"),
+          React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}},
+            [{l:"Sessions",v:stats.sessions},{l:"Signed",v:stats.signed},{l:"Conflicts",v:stats.conflicts},{l:"Avg score",v:stats.avgScore||"—"}].map(({l,v})=>
+              React.createElement("div",{key:l,style:S.card({padding:"10px",textAlign:"center",background:"#111521"})},
+                React.createElement("div",{style:{fontSize:18,fontWeight:800}},v),React.createElement("div",{style:{fontSize:10,color:"#475569"}},l)
+              )
+            )
+          )
+        ),
+        React.createElement("div",{style:S.eye()},"Session history"),
+        history.length===0?React.createElement("p",{style:{fontSize:12,color:"#334155"}},"No sessions yet."):
+          history.map(s=>{const b=BADGE_STYLE[s.badge]||BADGE_STYLE.PASS;return React.createElement("div",{key:s.id,style:S.card({padding:"10px 12px",background:"#0d0f18"})},
+            React.createElement("div",{style:{display:"flex",justifyContent:"space-between"}},
+              React.createElement("span",{style:{fontSize:12,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},s.patient),
+              React.createElement("span",{style:{fontSize:9,fontWeight:700,padding:"1px 6px",borderRadius:10,background:b.bg,color:b.color}},b.label)
+            ),
+            React.createElement("span",{style:{fontSize:10,color:"#64748b"}},s.mrn," · ",s.time)
+          );})
+      ),
+      React.createElement("main",{style:{padding:isMobile?"12px":"24px",overflowY:"auto"}},
+        React.createElement("div",{style:{marginBottom:20}},
+          React.createElement("h2",{style:{fontSize:isMobile?18:20,fontWeight:800,margin:"0 0 3px"}},"Good ",new Date().getHours()<12?"morning":"afternoon",", ",(clinician?.fullName||clinician?.email||"Doctor").split(" ")[0]),
+          React.createElement("p",{style:{fontSize:12,color:"#475569",margin:0}},"Select a patient encounter to begin")
+        ),
+        React.createElement("div",{style:S.eye({marginBottom:10})},"Today's patient encounters"),
+        React.createElement("div",{style:{display:"grid",gridTemplateColumns:isMobile?"1fr":isTablet?"1fr 1fr":"repeat(3,1fr)",gap:12}},
+          ENCOUNTERS.map(enc=>{const b=BADGE_STYLE[enc.badge];return React.createElement("button",{
+            key:enc.id,onClick:()=>pickEncounter(enc),
+            style:{...S.card(),padding:"16px",cursor:"pointer",textAlign:"left",display:"flex",flexDirection:"column"},
+          },
+            React.createElement("span",{style:{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:12,background:b.bg,color:b.color,alignSelf:"flex-start",marginBottom:8}},b.label),
+            React.createElement("div",{style:{fontWeight:700,fontSize:14,marginBottom:3}},enc.patientName),
+            React.createElement("div",{style:{fontSize:11,color:"#64748b"}},enc.mrn," · Age ",enc.age," · ",enc.gender),
+            React.createElement("div",{style:{fontSize:11,color:"#94a3b8",marginBottom:6}},"CC: ",enc.cc),
+            enc.allergies.length>0&&React.createElement("div",{style:{fontSize:10,color:"#f87171",background:"#1a0707",borderRadius:4,padding:"2px 7px",display:"inline-block"}},"⚠ ",enc.allergies.join(", ")),
+            React.createElement("div",{style:{fontSize:11,color:"#4f46e5",marginTop:10,fontWeight:600}},"Open session →")
+          );})
+        )
+      )
+    ),
+    toast&&React.createElement(Toast,{msg:toast.msg,type:toast.type,onDone:()=>setToast(null)})
+  );
+
+  // ═══════════════ VIEW: SESSION ═══════════════
+  if(view==="session") return React.createElement("div",{style:{minHeight:"100vh",background:"#0b0e16",color:"#e2e8f0",display:"flex",flexDirection:"column"}},
+    React.createElement(Header,{clinician,onBack:()=>setView("dashboard"),backLabel:"← Dashboard",onLogout:doLogout}),
+    React.createElement("div",{style:{flex:1,overflowY:"auto",padding:isMobile?"12px":"24px",display:"flex",justifyContent:"center"}},
+      React.createElement("div",{style:{width:"100%",maxWidth:680,display:"flex",flexDirection:"column",gap:12}},
+        React.createElement("div",{style:{...S.card({padding:"14px 16px"}),display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}},
+          React.createElement("div",{style:S.ava()},initials(encounter.patientName)),
+          React.createElement("div",{style:{flex:1,minWidth:160}},
+            React.createElement("div",{style:{fontWeight:700,fontSize:15}},encounter.patientName),
+            React.createElement("div",{style:{fontSize:11,color:"#64748b"}},encounter.mrn," · Age ",encounter.age," · ",encounter.gender),
+            React.createElement("div",{style:{fontSize:11,color:"#94a3b8"}},"CC: ",encounter.cc),
+            encounter.allergies.length>0&&React.createElement("div",{style:{fontSize:10,color:"#f87171"}},"⚠ ",encounter.allergies.join(", "))
+          ),
+          styleProfile&&React.createElement("div",{style:{fontSize:10,background:"#0e2a1a",borderRadius:6,padding:"4px 8px",color:"#4ade80"}},"🧠 Style learned")
+        ),
+        React.createElement("div",{style:{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"1fr 1fr 1fr",gap:10}},
+          React.createElement("div",{style:S.card({padding:"12px 13px"})},React.createElement("div",{style:S.eye()},"Specialty"),
+            React.createElement("select",{value:specialty,onChange:e=>setSpecialty(e.target.value),style:S.sel()},SPECIALTIES.map(s=>React.createElement("option",{key:s.id,value:s.id},s.icon," ",s.label)))
+          ),
+          React.createElement("div",{style:S.card({padding:"12px 13px"})},React.createElement("div",{style:S.eye()},"Language"),
+            React.createElement("select",{value:language,onChange:e=>setLanguage(e.target.value),style:S.sel()},["English","Spanish","French","German","Portuguese","Yoruba","Igbo","Hausa"].map(l=>React.createElement("option",{key:l},l)))
+          ),
+          React.createElement("div",{style:S.card({padding:"12px 13px",gridColumn:isMobile?"1 / -1":"auto"})},React.createElement("div",{style:S.eye()},"Input mode"),
+            React.createElement("div",{style:{display:"flex",gap:4}},[{id:"voice",l:"🎙 Voice"},{id:"type",l:"⌨️ Type"},{id:"both",l:"⚡ Both"}].map(m=>
+              React.createElement("button",{key:m.id,onClick:()=>setInputMode(m.id),style:{flex:1,padding:"7px 4px",borderRadius:7,border:`1px solid ${inputMode===m.id?"#6366f1":"#1e2535"}`,background:inputMode===m.id?"#13152a":"#0b0e16",color:inputMode===m.id?"#a5b4fc":"#475569",fontSize:11,fontWeight:700,cursor:"pointer"}},m.l)
+            ))
+          )
+        ),
+        React.createElement("div",{style:{...S.card({padding:"12px 16px"}),display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",background:consent?"#071a0f":"#0d1520",borderColor:consent?"#166534":"#1e3a5f"}},
+          React.createElement("span",{style:{fontSize:18}},consent?"✅":"🔒"),
+          React.createElement("div",{style:{flex:1}},
+            React.createElement("div",{style:{fontSize:12,fontWeight:700,color:consent?"#4ade80":"#93c5fd"}},consent?"Patient consent recorded":"Patient consent required before recording"),
+            React.createElement("div",{style:{fontSize:11,color:"#64748b"}},"Patient must be verbally informed this visit will be AI-transcribed.")
+          ),
+          !consent&&React.createElement("button",{onClick:()=>setConsent(true),style:S.btn("#1e3a5f",{color:"#93c5fd",fontSize:11,padding:"6px 12px"})},"✓ Consent Given")
+        ),
+        (inputMode==="voice"||inputMode==="both")&&React.createElement("div",{style:S.card({padding:"14px 16px",borderColor:active?"#166534":"#1e2535"})},
+          React.createElement("div",{style:{display:"flex",alignItems:"center",gap:10,marginBottom:10}},
+            React.createElement("div",{style:{width:10,height:10,borderRadius:"50%",background:active?"#4ade80":"#334155",animation:active?"blink 1s infinite":"none"}}),
+            React.createElement("span",{style:{fontSize:13,fontWeight:600,color:active?"#4ade80":"#475569"}},active?`Ambient listening · ${fmt(elapsed)}`:"Microphone standby"),
+            active&&React.createElement("span",{style:{marginLeft:"auto",background:"#7f1d1d",color:"#fca5a5",fontSize:10,fontWeight:800,padding:"3px 8px",borderRadius:4,animation:"blink 1.2s infinite"}},"● REC")
+          ),
+          React.createElement(Waveform,{active,playTime:null,total:totalDur}),
+          active&&cmdsOf(encounter.transcript).length>0&&React.createElement("div",{style:{marginTop:10}},
+            React.createElement("div",{style:S.eye()},"Scribe commands intercepted"),
+            cmdsOf(encounter.transcript).map((c,i)=>React.createElement("div",{key:i,style:{fontSize:11,color:"#93c5fd",background:"#0a1829",borderRadius:6,padding:"6px 10px",marginBottom:5,fontFamily:"monospace"}},"🎙 ",c))
+          ),
+          React.createElement("details",{style:{marginTop:10}},
+            React.createElement("summary",{style:{fontSize:11,color:"#475569"}},"View / override transcript"),
+            React.createElement("textarea",{value:customTx,onChange:e=>setCustomTx(e.target.value),placeholder:"Paste a custom transcript here…",rows:3,style:S.ta({marginTop:8,fontSize:11})})
+          )
+        ),
+        (inputMode==="type"||inputMode==="both")&&React.createElement("div",{style:S.card({padding:"14px 16px"})},
+          React.createElement("div",{style:S.eye({marginBottom:10})},"⌨️ Manual SOAP entry"),
+          React.createElement("div",{style:{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:10}},
+            Object.entries(SOAP_META).map(([k,m])=>React.createElement("div",{key:k},
+              React.createElement("div",{style:{fontSize:10,fontWeight:700,color:m.color,textTransform:"uppercase",marginBottom:4}},m.label),
+              React.createElement("textarea",{value:typedNote[k],onChange:e=>setTypedNote(n=>({...n,[k]:e.target.value})),placeholder:m.hint,rows:3,style:S.ta({borderColor:typedNote[k]?m.color+"44":"#1e2535"})})
+            ))
+          )
+        ),
+        React.createElement("div",{style:{display:"flex",gap:10,flexWrap:"wrap"}},
+          inputMode!=="type"&&(!active
+            ?React.createElement("button",{onClick:()=>{if(!consent){showToast("Record patient consent first.","error");return;}setActive(true);setElapsed(0);},style:S.btn("linear-gradient(135deg,#059669,#10b981)",{flex:1,justifyContent:"center"})},"▶ Start Session")
+            :React.createElement("button",{onClick:endSession,style:S.btn("linear-gradient(135deg,#dc2626,#ef4444)",{flex:1,justifyContent:"center"})},"⏹ End Session & Run Pipeline")
+          ),
+          (inputMode==="type"||inputMode==="both")&&!active&&React.createElement("button",{onClick:()=>{if(!consent){showToast("Record consent first.","error");return;}inputMode==="type"?runPipeline():endSession();},style:S.btn("linear-gradient(135deg,#4f46e5,#7c3aed)",{flex:1,justifyContent:"center"})},"⚡ Submit Note")
+        )
+      )
+    ),
+    toast&&React.createElement(Toast,{msg:toast.msg,type:toast.type,onDone:()=>setToast(null)})
+  );
+
+  // ═══════════════ VIEW: REVIEW ═══════════════
+  if(view==="review") return React.createElement("div",{style:{minHeight:"100vh",background:"#0b0e16",color:"#e2e8f0",display:"flex",flexDirection:"column"}},
+    React.createElement(Header,{clinician,onBack:()=>setView("dashboard"),backLabel:"← Dashboard",onLogout:doLogout}),
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:isMobile?"1fr":"240px 1fr",flex:1,overflow:"hidden"}},
+      !isMobile&&React.createElement("aside",{style:{borderRight:"1px solid #161c28",padding:"14px 12px",overflowY:"auto",display:"flex",flexDirection:"column",gap:12}},
+        React.createElement("div",{style:{...S.card({padding:"10px 12px"}),display:"flex",alignItems:"center",gap:10}},
+          React.createElement("div",{style:S.ava(32)},initials(encounter.patientName)),
+          React.createElement("div",{style:{flex:1,minWidth:0}},
+            React.createElement("div",{style:{fontSize:12,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},encounter.patientName),
+            React.createElement("div",{style:{fontSize:10,color:"#64748b"}},encounter.mrn)
+          ),
+          score&&React.createElement(ScoreRing,{score:score.score,size:48})
+        ),
+        React.createElement("div",null,React.createElement("div",{style:S.eye()},"Audio timeline"),
+          React.createElement(Waveform,{active:false,playTime,total:totalDur}),
+          playTime!=null&&React.createElement("div",{style:{fontSize:11,color:"#6366f1",marginTop:5}},"⏱ At ",fmt(playTime))
+        ),
+        React.createElement("div",{style:{display:"flex",gap:3}},[{id:"dss",l:"🧠 DSS"},{id:"cpt",l:"💳 CPT"},{id:"segments",l:"📍 Audio"}].map(p=>
+          React.createElement("button",{key:p.id,onClick:()=>setSidePanel(p.id),style:{flex:1,padding:"5px",borderRadius:6,border:`1px solid ${sidePanel===p.id?"#6366f1":"#1e2535"}`,background:sidePanel===p.id?"#13152a":"#0b0e16",color:sidePanel===p.id?"#a5b4fc":"#475569",fontSize:10,fontWeight:700,cursor:"pointer"}},p.l)
+        )),
+        sidePanel==="dss"&&(dss?.suggestions?.length>0?dss.suggestions.map((s,i)=>React.createElement("div",{key:i,style:S.card({padding:"10px 12px",background:"#0d1520",borderColor:s.priority==="high"?"#7f1d1d":"#1e2535"})},
+          React.createElement("div",{style:{display:"flex",gap:5,marginBottom:4}},React.createElement("span",{style:{fontSize:9,fontWeight:800,padding:"1px 6px",borderRadius:4,background:s.priority==="high"?"#7f1d1d":"#1e2535",color:s.priority==="high"?"#fca5a5":"#64748b"}},s.priority?.toUpperCase())),
+          React.createElement("div",{style:{fontSize:12,fontWeight:600,marginBottom:3}},s.title),React.createElement("div",{style:{fontSize:11,color:"#94a3b8"}},s.body)
+        )):React.createElement("p",{style:{fontSize:12,color:"#334155"}},loading?"Generating…":"No suggestions.")),
+        sidePanel==="cpt"&&(cpt?.codes?.length>0?cpt.codes.map((c,i)=>React.createElement("div",{key:i,style:S.card({padding:"10px 12px"})},
+          React.createElement("div",{style:{display:"flex",alignItems:"center",gap:6,marginBottom:4}},React.createElement("span",{style:{fontFamily:"monospace",fontSize:13,fontWeight:800,color:"#818cf8"}},c.code),c.fee_range&&React.createElement("span",{style:{marginLeft:"auto",fontSize:10,color:"#64748b"}},c.fee_range)),
+          React.createElement("div",{style:{fontSize:12,fontWeight:600}},c.description),React.createElement("div",{style:{fontSize:11,color:"#64748b"}},c.rationale)
+        )):React.createElement("p",{style:{fontSize:12,color:"#334155"}},loading?"Fetching…":"No codes.")),
+        sidePanel==="segments"&&encounter.segments.map((s,i)=>{const isA=playTime!=null&&playTime>=s.start&&playTime<=s.end;return React.createElement("div",{key:i,onClick:()=>setPlayTime(s.start),style:{display:"flex",gap:8,padding:"6px 8px",borderRadius:6,cursor:"pointer",border:`1px solid ${isA?"#4f46e5":"transparent"}`,background:isA?"#13152a":"transparent"}},React.createElement("span",{style:{fontSize:10,color:"#6366f1",fontWeight:700}},fmt(s.start)),React.createElement("span",{style:{fontSize:11,color:"#94a3b8"}},s.text));}),
+        scribeCmds.length>0&&React.createElement(React.Fragment,null,React.createElement("div",{style:S.eye()},"Scribe commands"),scribeCmds.map((c,i)=>React.createElement("div",{key:i,style:{fontSize:11,color:"#93c5fd",background:"#0a1829",borderRadius:6,padding:"5px 8px",marginBottom:4,fontFamily:"monospace"}},"🎙 ",c)))
+      ),
+      React.createElement("main",{style:{padding:isMobile?"12px":"18px 20px",overflowY:"auto",display:"flex",flexDirection:"column",gap:12}},
+        loading&&React.createElement("div",{style:{display:"flex",flexDirection:"column",alignItems:"center",padding:"32px 0",gap:8}},
+          ["Pass 1 — SOAP extraction","Pass 2 — CMO audit","Pass 3 — CPT codes","Pass 4 — Decision support","Pass 5 — Quality score","Saving"].map((p,i)=>{
+            const stages=["Pass 1","Pass 2","Pass 3","Pass 4","Pass 5","Saving"];
+            const cur=stages.findIndex(s=>phase.includes(s));
+            return React.createElement("div",{key:p,style:{display:"flex",alignItems:"center",gap:10,padding:"9px 14px",borderRadius:8,fontSize:12,width:isMobile?"90%":300,...(i<cur?{background:"#071a0f",color:"#4ade80",border:"1px solid #166534"}:i===cur?{background:"#13152a",color:"#a5b4fc",border:"1px solid #4f46e5"}:{background:"#111521",color:"#334155",border:"1px solid #161c28"})}},React.createElement("span",{style:{fontWeight:700,fontSize:11}},i<cur?"✓":i+1),p);
+          }),
+          React.createElement("p",{style:{fontSize:12,color:"#64748b",marginTop:8}},phase)
+        ),
+        apiErr&&React.createElement("div",{style:{...S.err(),display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}},
+          React.createElement("span",{style:{flex:1}},"⛔ ",apiErr),
+          failedPass&&React.createElement("button",{onClick:()=>runPipeline(failedPass),style:S.btn("#7f1d1d",{fontSize:11,padding:"6px 12px",whiteSpace:"nowrap"})},"🔄 Retry this step")
+        ),
+        audit&&React.createElement("div",{style:{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",border:"1px solid",borderRadius:10,padding:"12px 16px",background:conflicts.length===0?"#071a0f":"#1a0707",borderColor:conflicts.length===0?"#166534":"#7f1d1d"}},
+          React.createElement("span",{style:{fontSize:20}},conflicts.length===0?"✅":"🚨"),
+          React.createElement("div",{style:{flex:1}},React.createElement("div",{style:{fontWeight:700,fontSize:13,color:conflicts.length===0?"#4ade80":"#ff6b6b"}},conflicts.length===0?"Audit passed":`${conflicts.length} conflict(s) — locked`)),
+          score&&React.createElement(ScoreRing,{score:score.score,size:isMobile?44:54}),
+          conflicts.length>0&&React.createElement("span",{style:{background:"#7f1d1d",color:"#fca5a5",fontSize:10,fontWeight:800,padding:"3px 9px",borderRadius:5}},"🔒 LOCKED")
+        ),
+        conflicts.length>0&&React.createElement("div",null,
+          React.createElement("div",{style:S.eye({marginBottom:8})},"Safety flags · click to scrub audio"),
+          conflicts.map((c,i)=>{const ss=SEV[c.severity]||SEV.INFO;return React.createElement("div",{key:i,style:{borderLeft:`3px solid ${ss.bar}`,borderRadius:"0 10px 10px 0",padding:"12px 14px",background:ss.bg,border:"1px solid #1e2535",marginBottom:8}},
+            React.createElement("div",{style:{display:"flex",gap:7,marginBottom:5}},React.createElement("span",{style:{fontSize:10,fontWeight:800,padding:"2px 7px",borderRadius:4,background:ss.chip,color:ss.text}},c.severity),React.createElement("span",{style:{fontSize:11,color:"#94a3b8"}},"→ ",c.target_section)),
+            React.createElement("p",{onClick:()=>c.transcript_quote&&scrub(c.transcript_quote),style:{fontSize:13,margin:"0 0 5px",cursor:"pointer",textDecoration:"underline dotted #475569"}},c.description),
+            c.transcript_quote&&React.createElement("p",{style:{fontSize:11,color:"#475569",fontStyle:"italic",margin:"0 0 5px"}},"📍 \"",c.transcript_quote,"\""),
+            React.createElement("p",{style:{fontSize:12,color:"#818cf8",margin:0}},React.createElement("strong",null,"💡 Fix: "),c.resolution_suggestion)
+          );}),
+          React.createElement("label",{style:{display:"flex",gap:10,background:"#111521",border:"1px solid #1e2535",borderRadius:8,padding:"11px 14px",cursor:"pointer"}},
+            React.createElement("input",{type:"checkbox",checked:override,onChange:e=>setOverride(e.target.checked),style:{accentColor:"#6366f1",width:15,height:15}}),
+            React.createElement("span",{style:{fontSize:12,color:"#94a3b8"}},React.createElement("strong",{style:{color:"#e2e8f0"}},"MD override:")," I accept full liability for this note as written.")
+          )
+        ),
+        draft&&React.createElement(React.Fragment,null,
+          React.createElement("div",{style:{display:"flex",gap:2,borderBottom:"1px solid #1e2535"}},[{id:"soap",l:"📋 SOAP"},{id:"diff",l:`✏ Edits${hasDiff?" ●":""}`}].map(t=>
+            React.createElement("button",{key:t.id,onClick:()=>setReviewTab(t.id),style:{padding:"7px 14px",border:"none",background:"transparent",color:reviewTab===t.id?"#e2e8f0":"#64748b",fontSize:12,fontWeight:600,cursor:"pointer",borderBottom:`2px solid ${reviewTab===t.id?"#6366f1":"transparent"}`,marginBottom:-1}},t.l)
+          )),
+          reviewTab==="soap"&&React.createElement("div",{style:{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:10}},
+            Object.entries(SOAP_META).map(([k,m])=>React.createElement("div",{key:k,style:S.card({padding:"14px",borderTop:`2px solid ${m.color}33`})},
+              React.createElement("div",{style:{display:"flex",justifyContent:"space-between",marginBottom:8}},
+                React.createElement("div",{style:{fontSize:10,fontWeight:700,color:m.color,textTransform:"uppercase"}},m.label),
+                !signed&&React.createElement("button",{onClick:()=>setEditField(editField===k?null:k),style:{fontSize:10,background:"transparent",border:"none",color:editField===k?"#4ade80":"#475569",cursor:"pointer"}},editField===k?"✓ Done":"✏ Edit")
+              ),
+              editField===k?React.createElement("textarea",{value:edited?.[k]||"",onChange:e=>setEdited(p=>({...p,[k]:e.target.value})),rows:4,style:S.ta({borderColor:m.color+"44"})}):React.createElement("p",{style:{fontSize:12.5,color:"#cbd5e1",margin:0,lineHeight:1.65}},edited?.[k]||draft[k]||"—")
+            ))
+          ),
+          reviewTab==="diff"&&React.createElement("div",{style:{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:10}},
+            Object.entries(SOAP_META).map(([k,m])=>{const o=origDraft?.[k]||"",e2=edited?.[k]||"",changed=o!==e2;return React.createElement("div",{key:k,style:S.card({padding:"14px",borderTop:`2px solid ${changed?"#166534":"#1e2535"}`,opacity:changed?1:0.5})},
+              React.createElement("div",{style:{fontSize:10,fontWeight:700,color:m.color,marginBottom:8}},m.label,changed&&React.createElement("span",{style:{fontSize:9,color:"#4ade80",marginLeft:4}},"EDITED")),
+              changed?React.createElement("span",null,React.createElement("span",{style:{textDecoration:"line-through",color:"#475569",fontSize:11,marginRight:5}},o),React.createElement("span",{style:{color:"#4ade80",background:"#071a0f",borderRadius:3,padding:"1px 5px",fontSize:12}},e2)):React.createElement("span",{style:{color:"#334155",fontStyle:"italic",fontSize:12}},"No changes")
+            );})
+          ),
+          React.createElement("div",{style:{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap",paddingTop:4}},
+            React.createElement("button",{onClick:doTakehome,disabled:thLoading||!audit,style:S.ghost({opacity:(!audit||thLoading)?0.4:1})},thLoading?"…":"📋 Take-Home"),
+            React.createElement("button",{onClick:doReferral,disabled:refLoading||!audit,style:S.ghost({opacity:(!audit||refLoading)?0.4:1})},refLoading?"…":"📨 Referral"),
+            signed?React.createElement("div",{style:{display:"flex",gap:8}},
+              React.createElement("span",{style:{padding:"8px 14px",borderRadius:8,background:"#071a0f",border:"1px solid #166534",color:"#4ade80",fontSize:12,fontWeight:700}},"✅ MD Verified & Locked"),
+              !ehrSynced?React.createElement("button",{onClick:doEhrSync,style:S.btn("#1e3a5f",{color:"#93c5fd",fontSize:12,padding:"8px 13px"})},"📡 Sync EHR"):React.createElement("span",{style:{fontSize:11,color:"#4ade80"}},"✓ EHR synced")
+            ):React.createElement("button",{onClick:()=>{if(canSign)setPinModal(true);},disabled:!canSign,style:canSign?S.btn("linear-gradient(135deg,#059669,#10b981)"):{...S.btn("#161c28"),color:"#334155"}},locked?"🔒 Resolve conflicts":"✍ Sign & Lock")
+          )
+        )
+      )
+    ),
+    pinModal&&React.createElement("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.78)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:600,padding:16}},
+      React.createElement("div",{style:S.card({padding:"28px 24px",width:"100%",maxWidth:360})},
+        React.createElement("h3",{style:{fontSize:16,fontWeight:800,margin:"0 0 6px"}},"MD Sign-Off"),
+        React.createElement("p",{style:{fontSize:12,color:"#64748b",margin:"0 0 18px"}},"Enter your account password to seal this note."),
+        React.createElement("input",{type:"password",value:pin,onChange:e=>setPin(e.target.value),placeholder:"••••••••",style:S.inp(),autoFocus:true,onKeyDown:e=>e.key==="Enter"&&doSign()}),
+        pinErr&&React.createElement("div",{style:{...S.err(),marginTop:8}},pinErr),
+        React.createElement("div",{style:{display:"flex",gap:8,marginTop:14}},
+          React.createElement("button",{onClick:()=>setPinModal(false),style:{...S.ghost(),flex:1}},"Cancel"),
+          React.createElement("button",{onClick:doSign,style:S.btn("linear-gradient(135deg,#059669,#10b981)",{flex:1,justifyContent:"center"})},"Confirm & Sign")
+        )
+      )
+    ),
+    toast&&React.createElement(Toast,{msg:toast.msg,type:toast.type,onDone:()=>setToast(null)})
+  );
+
+  // ═══════════════ VIEW: TAKE-HOME ═══════════════
+  if(view==="takehome"&&takehome) return React.createElement("div",{style:{minHeight:"100vh",background:"#0b0e16",color:"#e2e8f0",display:"flex",flexDirection:"column"}},
+    React.createElement(Header,{clinician,onBack:()=>setView("review"),backLabel:"← Review"}),
+    React.createElement("div",{style:{flex:1,overflowY:"auto",padding:isMobile?"12px":"28px",display:"flex",justifyContent:"center"}},
+      React.createElement("div",{style:S.card({width:"100%",maxWidth:640,padding:isMobile?"20px":"28px"})},
+        React.createElement("div",{style:{marginBottom:20,paddingBottom:16,borderBottom:"2px solid #1e2535"}},
+          React.createElement("div",{style:{fontSize:10,fontWeight:700,color:"#6366f1",textTransform:"uppercase"}},"Patient Take-Home · ",language),
+          React.createElement("div",{style:{fontWeight:800,fontSize:20}},encounter.patientName),
+          React.createElement("div",{style:{fontSize:12,color:"#64748b"}},encounter.mrn," · ",new Date().toLocaleDateString())
+        ),
+        React.createElement("p",{style:{fontSize:14,color:"#cbd5e1",lineHeight:1.7,marginBottom:20}},takehome.greeting),
+        [["🔍 What we found today","what_we_found"],["💊 Your treatment plan","your_treatment"],["⚠ Important warnings","important_warnings"]].map(([label,key])=>
+          React.createElement("div",{key,style:{marginBottom:18}},React.createElement("div",{style:{fontSize:13,fontWeight:700,marginBottom:8}},label),
+            React.createElement("ul",{style:{margin:0,paddingLeft:18}},(takehome[key]||[]).map((item,i)=>React.createElement("li",{key:i,style:{fontSize:13,color:"#94a3b8",lineHeight:1.6,marginBottom:4}},item)))
+          )
+        ),
+        React.createElement("div",{style:S.card({padding:"11px 14px",background:"#0d1520",borderColor:"#1e3a5f",marginBottom:16})},
+          React.createElement("strong",{style:{color:"#6366f1",fontSize:13}},"📅 Follow-up: "),React.createElement("span",{style:{fontSize:13,color:"#cbd5e1"}},takehome.follow_up)
+        ),
+        React.createElement("p",{style:{fontSize:12,color:"#64748b",fontStyle:"italic",marginBottom:16}},takehome.closing),
+        React.createElement("div",{style:{display:"flex",gap:10,justifyContent:"flex-end",flexWrap:"wrap"}},
+          React.createElement("button",{onClick:()=>window.print(),style:S.ghost()},"🖨 Print"),
+          React.createElement("button",{onClick:()=>setView("review"),style:S.btn("linear-gradient(135deg,#4f46e5,#7c3aed)")},"Done")
+        )
+      )
+    )
+  );
+
+  // ═══════════════ VIEW: REFERRAL ═══════════════
+  if(view==="referral"&&referral) return React.createElement("div",{style:{minHeight:"100vh",background:"#0b0e16",color:"#e2e8f0",display:"flex",flexDirection:"column"}},
+    React.createElement(Header,{clinician,onBack:()=>setView("review"),backLabel:"← Review"}),
+    React.createElement("div",{style:{flex:1,overflowY:"auto",padding:isMobile?"12px":"28px",display:"flex",justifyContent:"center"}},
+      React.createElement("div",{style:S.card({width:"100%",maxWidth:640,padding:isMobile?"20px":"28px"})},
+        React.createElement("div",{style:{fontSize:10,fontWeight:700,color:"#6366f1",textTransform:"uppercase",marginBottom:12}},"Referral Letter"),
+        React.createElement("div",{style:{marginBottom:5}},React.createElement("strong",{style:{fontSize:12,color:"#64748b"}},"To: "),referral.to),
+        React.createElement("div",{style:{marginBottom:16}},React.createElement("strong",{style:{fontSize:12,color:"#64748b"}},"Re: "),referral.subject),
+        React.createElement("pre",{style:{fontSize:13,color:"#cbd5e1",lineHeight:1.7,whiteSpace:"pre-wrap",fontFamily:"inherit",borderTop:"1px solid #1e2535",paddingTop:16}},referral.body),
+        React.createElement("div",{style:{display:"flex",gap:10,justifyContent:"flex-end",marginTop:18,flexWrap:"wrap"}},
+          React.createElement("button",{onClick:()=>window.print(),style:S.ghost()},"🖨 Print"),
+          React.createElement("button",{onClick:()=>setView("review"),style:S.btn("linear-gradient(135deg,#4f46e5,#7c3aed)")},"Done")
+        )
+      )
+    )
+  );
+
+  return null;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
