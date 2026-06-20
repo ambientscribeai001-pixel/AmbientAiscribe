@@ -1,170 +1,209 @@
-// webhooks/paystack.js
-// ─── Paystack Webhook Handler · AmbientScribe ─────────────────────────────────
-// Paystack POSTs signed events here for every billing lifecycle event.
-// This is how your DB stays in sync with what Paystack actually charged.
+// config/paystack.js
+// ─── Paystack API Service · AmbientScribe ────────────────────────────────────
 'use strict';
 
-const crypto       = require('crypto');
-const express      = require('express');
-const User         = require('../models/User');
-const Subscription = require('../models/Subscription');
-
-const router = express.Router();
+const https = require('https');
 
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 
-// ── Signature verification ────────────────────────────────────────────────────
-// IMPORTANT: this route must receive the RAW body (not JSON-parsed).
-// In server.js, mount BEFORE express.json() middleware, or use express.raw() here.
-function verifyPaystackSignature(req, res, next) {
-  const signature = req.headers['x-paystack-signature'];
-  if (!signature) {
-    return res.status(400).json({ message: 'Missing Paystack signature.' });
-  }
-
-  const hash = crypto
-    .createHmac('sha512', PAYSTACK_SECRET)
-    .update(req.body) // req.body must be raw Buffer here
-    .digest('hex');
-
-  if (hash !== signature) {
-    console.warn('[Webhook] Invalid Paystack signature — possible spoofed request.');
-    return res.status(401).json({ message: 'Invalid signature.' });
-  }
-
-  // Parse body now that signature is verified
-  try {
-    req.paystackEvent = JSON.parse(req.body.toString());
-  } catch {
-    return res.status(400).json({ message: 'Invalid JSON body.' });
-  }
-
-  next();
+if (!PAYSTACK_SECRET) {
+  console.warn('[Paystack] WARNING: PAYSTACK_SECRET_KEY not set. Payment routes will fail.');
 }
 
-// ── Map Paystack plan codes back to our tier names ────────────────────────────
+const BASE_URL = 'api.paystack.co';
+
+// ── Plan codes (set in .env, sourced from Paystack dashboard) ─────────────────
+// Monthly plans — all amounts in NGN
+const PLAN_CODES = {
+  // Clinical Pro — ₦ equivalent of $300/month
+  pro_monthly:        process.env.PAYSTACK_PRO_MONTHLY_PLAN_CODE        || 'PLN_bhwojzlyqlcjwpu',
+
+  // Clinic — ₦ equivalent of $400/month
+  clinic_monthly:     process.env.PAYSTACK_CLINIC_MONTHLY_PLAN_CODE     || 'PLN_e37xlb078c3t1y4',
+
+  // Enterprise — ₦ equivalent of $450/month
+  enterprise_monthly: process.env.PAYSTACK_ENTERPRISE_MONTHLY_PLAN_CODE || 'PLN_4udww3kyncpzxaz',
+
+  // Annual plans — add codes when created in dashboard
+  pro_annual:         process.env.PAYSTACK_PRO_ANNUAL_PLAN_CODE         || null,
+  clinic_annual:      process.env.PAYSTACK_CLINIC_ANNUAL_PLAN_CODE      || null,
+  enterprise_annual:  process.env.PAYSTACK_ENTERPRISE_ANNUAL_PLAN_CODE  || null,
+};
+
+// ── Pricing reference (for display only — actual amounts live in Paystack) ────
+const PRICES_NGN = {
+  pro:        { monthly: null, annual: null }, // pulled from Paystack dashboard
+  clinic:     { monthly: null, annual: null },
+  enterprise: { monthly: null, annual: null },
+};
+
+// ── Core HTTP helper ──────────────────────────────────────────────────────────
+function paystackRequest(method, path, body = null) {
+  return new Promise((resolve, reject) => {
+    const payload = body ? JSON.stringify(body) : null;
+
+    const options = {
+      hostname: BASE_URL,
+      port:     443,
+      path,
+      method,
+      headers: {
+        Authorization:  `Bearer ${PAYSTACK_SECRET}`,
+        'Content-Type': 'application/json',
+        ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
+      },
+    };
+
+    const req = https.request(options, res => {
+      let data = '';
+      res.on('data', chunk => (data += chunk));
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (!parsed.status) {
+            reject(new Error(parsed.message || 'Paystack API error'));
+          } else {
+            resolve(parsed);
+          }
+        } catch {
+          reject(new Error('Invalid JSON from Paystack'));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+// ── Resolve plan code from plan name + billing cycle ─────────────────────────
+function resolvePlanCode(plan, cycle = 'monthly') {
+  const key  = `${plan}_${cycle}`;
+  const code = PLAN_CODES[key];
+
+  if (!code) {
+    // Annual plans not set up yet — fall back to monthly
+    if (cycle === 'annual') {
+      console.warn(`[Paystack] Annual plan code for ${plan} not configured. Falling back to monthly.`);
+      return PLAN_CODES[`${plan}_monthly`];
+    }
+    throw new Error(
+      `No Paystack plan code for: ${key}. ` +
+      `Add PAYSTACK_${plan.toUpperCase()}_${cycle.toUpperCase()}_PLAN_CODE to .env`
+    );
+  }
+  return code;
+}
+
+// ── Resolve plan tier name from a Paystack plan code ─────────────────────────
 function planFromCode(planCode) {
-  if (planCode === process.env.PAYSTACK_PRO_PLAN_CODE)        return 'pro';
-  if (planCode === process.env.PAYSTACK_ENTERPRISE_PLAN_CODE) return 'enterprise';
+  for (const [key, code] of Object.entries(PLAN_CODES)) {
+    if (code && code === planCode) {
+      return key.split('_')[0]; // "pro_monthly" → "pro"
+    }
+  }
   return 'free';
 }
 
-// ── Upsert subscription helper ────────────────────────────────────────────────
-async function upsertSubscription(userId, updates) {
-  return Subscription.findOneAndUpdate(
-    { user: userId },
-    { $set: updates },
-    { upsert: true, new: true }
-  );
+// ── Initialize a subscription checkout ───────────────────────────────────────
+// Returns { authorization_url, access_code, reference }
+// Frontend opens authorization_url — Paystack shows the customer a page with
+// ALL enabled channels: Card, Bank Transfer, USSD, Mobile Money, QR.
+// Channels are controlled in Paystack Dashboard → Settings → Preferences,
+// but we also pass them explicitly here so checkout always offers the full set.
+async function initializeTransaction({ email, plan, cycle = 'monthly', callbackUrl, metadata = {} }) {
+  const planCode = resolvePlanCode(plan, cycle);
+
+  const response = await paystackRequest('POST', '/transaction/initialize', {
+    email,
+    plan:         planCode,
+    callback_url: callbackUrl || process.env.PAYSTACK_CALLBACK_URL,
+    currency:     process.env.PAYSTACK_CURRENCY || 'NGN',
+    // Offer every supported channel — customer picks on Paystack's page
+    channels: ['card', 'bank', 'bank_transfer', 'ussd', 'qr', 'mobile_money'],
+    metadata: {
+      plan,
+      cycle,
+      custom_fields: [
+        { display_name: 'Plan',    variable_name: 'plan',  value: plan  },
+        { display_name: 'Billing', variable_name: 'cycle', value: cycle },
+      ],
+      ...metadata,
+    },
+  });
+
+  return response.data;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/v1/webhooks/paystack
-// ─────────────────────────────────────────────────────────────────────────────
-router.post(
-  '/',
-  express.raw({ type: 'application/json' }), // raw body for HMAC verification
-  verifyPaystackSignature,
-  async (req, res) => {
-    // Always respond 200 immediately — Paystack retries if it doesn't get one
-    res.status(200).json({ received: true });
+// ── One-time payment (non-subscription) — for invoices, top-ups, USD billing ──
+// Use this when you want a one-off charge instead of a recurring plan,
+// e.g. an annual Enterprise contract invoice paid manually.
+async function initializeOneTimePayment({ email, amount, currency, callbackUrl, metadata = {} }) {
+  const response = await paystackRequest('POST', '/transaction/initialize', {
+    email,
+    amount:       Math.round(amount * 100), // Paystack expects amount in kobo/cents
+    currency:     currency || process.env.PAYSTACK_CURRENCY || 'NGN',
+    callback_url: callbackUrl || process.env.PAYSTACK_CALLBACK_URL,
+    channels:     ['card', 'bank', 'bank_transfer', 'ussd', 'qr', 'mobile_money'],
+    metadata,
+  });
+  return response.data;
+}
 
-    const event = req.paystackEvent;
-    const data  = event?.data;
+// ── Verify a transaction after Paystack redirects back ────────────────────────
+async function verifyTransaction(reference) {
+  const response = await paystackRequest(
+    'GET',
+    `/transaction/verify/${encodeURIComponent(reference)}`
+  );
+  return response.data;
+}
 
-    console.log(`[Webhook] Paystack event received: ${event.event}`);
+// ── Fetch a subscription by code ──────────────────────────────────────────────
+async function fetchSubscription(subscriptionCode) {
+  const response = await paystackRequest(
+    'GET',
+    `/subscription/${encodeURIComponent(subscriptionCode)}`
+  );
+  return response.data;
+}
 
-    try {
-      switch (event.event) {
+// ── Disable (cancel) a subscription ──────────────────────────────────────────
+async function cancelSubscription(subscriptionCode, emailToken) {
+  const response = await paystackRequest('POST', '/subscription/disable', {
+    code:  subscriptionCode,
+    token: emailToken,
+  });
+  return response.data;
+}
 
-        // ── New subscription created (after checkout) ─────────────────────
-        case 'subscription.create': {
-          const email = data.customer?.email;
-          if (!email) break;
+// ── Create a Paystack customer ────────────────────────────────────────────────
+async function createCustomer({ email, first_name, last_name }) {
+  const response = await paystackRequest('POST', '/customer', {
+    email,
+    first_name,
+    last_name,
+  });
+  return response.data;
+}
 
-          const user = await User.findOne({ email: email.toLowerCase() });
-          if (!user) { console.warn('[Webhook] subscription.create: user not found for', email); break; }
+// ── Fetch all active plans from Paystack (for pricing page) ──────────────────
+async function fetchPlans() {
+  const response = await paystackRequest('GET', '/plan?status=active&perPage=20');
+  return response.data;
+}
 
-          await upsertSubscription(user._id, {
-            plan:                    planFromCode(data.plan?.plan_code),
-            status:                  'active',
-            paystackCustomerId:      data.customer?.customer_code,
-            paystackSubscriptionId:  data.id?.toString(),
-            paystackSubscriptionCode: data.subscription_code,
-            paystackEmailToken:      data.email_token,
-            currentPeriodStart:      new Date(data.created_at),
-            currentPeriodEnd:        new Date(data.next_payment_date),
-          });
-
-          console.log(`[Webhook] Subscription activated for ${email} → ${planFromCode(data.plan?.plan_code)}`);
-          break;
-        }
-
-        // ── Successful recurring charge ───────────────────────────────────
-        case 'charge.success': {
-          if (data.plan?.plan_code) {
-            const email = data.customer?.email;
-            if (!email) break;
-            const user = await User.findOne({ email: email.toLowerCase() });
-            if (!user) break;
-
-            await upsertSubscription(user._id, {
-              status:           'active',
-              currentPeriodEnd: new Date(data.paid_at
-                ? new Date(data.paid_at).getTime() + 30 * 24 * 60 * 60 * 1000
-                : Date.now()  + 30 * 24 * 60 * 60 * 1000
-              ),
-            });
-            console.log(`[Webhook] Renewal confirmed for ${email}`);
-          }
-          break;
-        }
-
-        // ── Payment failed ────────────────────────────────────────────────
-        case 'invoice.payment_failed': {
-          const email = data.customer?.email;
-          if (!email) break;
-          const user = await User.findOne({ email: email.toLowerCase() });
-          if (!user) break;
-
-          await upsertSubscription(user._id, { status: 'past_due' });
-          console.log(`[Webhook] Payment failed for ${email} — marked past_due`);
-          // TODO: trigger email to doctor via SendGrid/Resend
-          break;
-        }
-
-        // ── Subscription disabled / cancelled ─────────────────────────────
-        case 'subscription.disable': {
-          const subscriptionCode = data.subscription_code;
-          if (!subscriptionCode) break;
-
-          const sub = await Subscription.findOne({
-            paystackSubscriptionCode: subscriptionCode,
-          });
-          if (!sub) break;
-
-          sub.status      = 'cancelled';
-          sub.cancelledAt = new Date();
-          // Keep currentPeriodEnd — they still have access until that date
-          await sub.save();
-          console.log(`[Webhook] Subscription cancelled: ${subscriptionCode}`);
-          break;
-        }
-
-        // ── Subscription fully expired ────────────────────────────────────
-        case 'subscription.expiry_reminder':
-          // No DB change needed — just log. Could trigger reminder email here.
-          console.log(`[Webhook] Expiry reminder for subscription: ${data.subscription_code}`);
-          break;
-
-        default:
-          console.log(`[Webhook] Unhandled event type: ${event.event} — ignoring.`);
-      }
-    } catch (err) {
-      // Don't re-throw — we already sent 200. Log for investigation.
-      console.error('[Webhook] Handler error:', err.name, err.message);
-    }
-  }
-);
-
-module.exports = router;
+module.exports = {
+  initializeTransaction,
+  initializeOneTimePayment,
+  verifyTransaction,
+  fetchSubscription,
+  cancelSubscription,
+  createCustomer,
+  fetchPlans,
+  resolvePlanCode,
+  planFromCode,
+  PLAN_CODES,
+  PRICES_NGN,
+};

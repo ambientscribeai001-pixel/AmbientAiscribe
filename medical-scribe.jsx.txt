@@ -1,0 +1,925 @@
+import { useState, useRef, useEffect, useCallback } from "react";
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const BACKEND_URL = ""; // paste your Railway/Render URL here once deployed
+const DEMO_MODE   = !BACKEND_URL;
+
+// ─── PRICING (single source of truth — mirrors backend PLANS) ─────────────────
+const PLANS = [
+  {
+    id: "free", name: "Free", monthlyPrice: 0, annualPrice: 0,
+    period: "forever", badge: null,
+    color: "#334155", accent: "#64748b",
+    cta: "Start free", trialDays: 0,
+    notes: "5 notes/month",
+    features: [
+      "5 notes per month",
+      "SOAP generation",
+      "Basic CMO safety audit",
+      "Copy-paste export",
+      "1 specialty template",
+    ],
+  },
+  {
+    id: "pro", name: "Clinical Pro", monthlyPrice: 300, annualPrice: 240,
+    period: "per provider / month", badge: "MOST POPULAR",
+    color: "#4f46e5", accent: "#818cf8",
+    cta: "Start 3-day free trial", trialDays: 3,
+    notes: "Unlimited notes",
+    features: [
+      "Unlimited notes",
+      "Full 5-pass AI pipeline",
+      "CMO audit — allergy & diagnosis conflict detection",
+      "CPT billing codes + ICD-10",
+      "Clinical decision support",
+      "Note quality scoring 0–100",
+      "Style learning engine",
+      "6 specialty templates",
+      "Referral letter generator",
+      "Take-home patient instructions",
+      "Multi-language (35+)",
+      "Batch end-of-shift signing",
+      "EHR copy-paste export",
+    ],
+  },
+  {
+    id: "clinic", name: "Clinic", monthlyPrice: 400, annualPrice: 320,
+    period: "per provider / month", badge: null,
+    color: "#7c3aed", accent: "#a78bfa",
+    cta: "Start 3-day free trial", trialDays: 3,
+    notes: "Unlimited notes",
+    features: [
+      "Everything in Clinical Pro",
+      "Up to 10 providers",
+      "Shared session history across team",
+      "Clinic-wide analytics dashboard",
+      "Custom note templates per provider",
+      "Monthly billing report",
+      "Priority support",
+      "Bulk provider onboarding",
+    ],
+  },
+  {
+    id: "enterprise", name: "Enterprise", monthlyPrice: 450, annualPrice: null,
+    period: "per provider / month", badge: null,
+    color: "#0e7490", accent: "#67e8f9",
+    cta: "Contact sales", trialDays: 3,
+    notes: "Unlimited notes",
+    features: [
+      "Everything in Clinic",
+      "Unlimited providers",
+      "Direct EHR push (Epic / Cerner — FHIR R4)",
+      "SSO & SAML",
+      "SOC 2 Type II BAA",
+      "Dedicated onboarding & implementation",
+      "Custom specialty AI tuning",
+      "Immutable audit logs & compliance reports",
+      "SLA 99.9% uptime",
+      "Volume pricing & annual contracts",
+      "White-label option",
+    ],
+  },
+];
+
+// ─── DEVICE DETECTION ─────────────────────────────────────────────────────────
+function useDevice() {
+  const [d, setD] = useState(() => window.innerWidth < 640 ? "mobile" : window.innerWidth < 1024 ? "tablet" : "desktop");
+  useEffect(() => {
+    const fn = () => setD(window.innerWidth < 640 ? "mobile" : window.innerWidth < 1024 ? "tablet" : "desktop");
+    window.addEventListener("resize", fn);
+    return () => window.removeEventListener("resize", fn);
+  }, []);
+  return d;
+}
+
+// ─── API CLIENT ───────────────────────────────────────────────────────────────
+function useApi(token) {
+  return useCallback(async (method, path, body = null) => {
+    if (DEMO_MODE) throw new Error("Demo mode — backend not connected");
+    const res = await fetch(`${BACKEND_URL}${path}`, {
+      method,
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || `API ${res.status}`);
+    return data;
+  }, [token]);
+}
+
+// ─── CLAUDE API ───────────────────────────────────────────────────────────────
+async function claudeJSON(system, user) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, system, messages: [{ role: "user", content: user }] }),
+  });
+  const d = await res.json();
+  if (!res.ok) throw new Error(d.error?.message || "Claude API error");
+  const raw = d.content.map(b => b.text || "").join("");
+  return JSON.parse(raw.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim());
+}
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const SPECIALTIES = [
+  { id: "general",     icon: "🩺", label: "General Medicine", focus: "vital signs, common illnesses, medications" },
+  { id: "cardiology",  icon: "❤️",  label: "Cardiology",       focus: "heart rhythm, murmurs, ECG, ejection fraction" },
+  { id: "pediatrics",  icon: "👶", label: "Pediatrics",        focus: "growth percentiles, milestones, vaccinations" },
+  { id: "orthopedics", icon: "🦴", label: "Orthopedics",       focus: "ROM, fractures, joint stability" },
+  { id: "psychiatry",  icon: "🧠", label: "Psychiatry",        focus: "mood, cognition, suicidality, medications" },
+  { id: "oncology",    icon: "🔬", label: "Oncology",          focus: "staging, chemotherapy, performance status" },
+];
+const SOAP_META = {
+  subjective: { label: "S — Subjective", color: "#818cf8", hint: "Chief complaint, HPI, patient symptoms" },
+  objective:  { label: "O — Objective",  color: "#34d399", hint: "Vitals, exam findings, labs" },
+  assessment: { label: "A — Assessment", color: "#f472b6", hint: "Diagnosis / differentials" },
+  plan:       { label: "P — Plan",       color: "#fb923c", hint: "Treatment, meds, follow-up" },
+};
+const BADGE = {
+  CRITICAL: { bg: "#3d0e0e", color: "#ff6b6b", label: "🚨 Critical" },
+  WARNING:  { bg: "#3d2800", color: "#ffb347", label: "⚠ Warning"  },
+  PASS:     { bg: "#0e2a1a", color: "#4ade80", label: "✓ Clean"    },
+};
+const SEV = {
+  CRITICAL: { bar: "#ef4444", bg: "#1a0606", text: "#fca5a5", chip: "#7f1d1d" },
+  WARNING:  { bar: "#f59e0b", bg: "#1a1000", text: "#fcd34d", chip: "#78350f" },
+  INFO:     { bar: "#3b82f6", bg: "#06101a", text: "#93c5fd", chip: "#1e3a5f" },
+};
+const ENCOUNTERS = [
+  { id:"1", badge:"CRITICAL", specialty:"general", patientName:"James Whitfield", dob:"1974-03-12", mrn:"MRN-004821", age:51, gender:"M", cc:"Sore throat × 3 days", allergies:["Penicillin","Sulfa drugs"],
+    transcript:`Doctor: Hello Mr. Whitfield, what brings you in today?\nPatient: I've got this painful throat, hurts to swallow. Also I have a severe allergy to penicillin.\nScribe command: note patient explicitly reports severe penicillin allergy, confirmed verbally.\nDoctor: Throat shows tonsillar exudate. I'll prescribe Amoxicillin 500mg, one capsule TID for 10 days.`,
+    segments:[{start:0,end:7,text:"Hello, what brings you in?"},{start:8,end:18,text:"Painful throat. Severe penicillin allergy."},{start:19,end:42,text:"Tonsillar exudate. Prescribing Amoxicillin 500mg TID for 10 days."}]},
+  { id:"2", badge:"WARNING", specialty:"cardiology", patientName:"Sandra Okafor", dob:"1961-09-28", mrn:"MRN-007133", age:64, gender:"F", cc:"Mild exertional fatigue", allergies:["Aspirin"],
+    transcript:`Patient: Occasional mild fatigue walking long distances, nothing dramatic.\nDoctor: Lungs clear. Cardiac: normal rate, regular rhythm, normal S1/S2, no murmurs.\nDoctor: Based on this completely normal examination, primary diagnosis is Acute Myocardial Infarction.`,
+    segments:[{start:0,end:9,text:"Occasional mild fatigue on exertion."},{start:10,end:30,text:"Lungs clear. Cardiac normal. No murmurs."},{start:31,end:44,text:"Normal exam. Diagnosis: Acute MI."}]},
+  { id:"3", badge:"PASS", specialty:"pediatrics", patientName:"Lily Park", dob:"2020-06-01", mrn:"MRN-012044", age:4, gender:"F", cc:"4-year well-child visit", allergies:[],
+    transcript:`Parent: My 4-year-old is here for wellness check. Eating well and very active.\nDoctor: Weight 16 kg, 50th percentile.\nDoctor: Lungs clear bilaterally. HR 90 bpm, normal rhythm. Milestones on track. Proceeding with immunizations.`,
+    segments:[{start:0,end:7,text:"4-year wellness check."},{start:8,end:15,text:"Weight 16 kg, 50th percentile."},{start:16,end:30,text:"Lungs clear. HR 90 bpm. Milestones on track."}]},
+];
+
+const fmt = s => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+const extractCmds = t => t.split("\n").filter(l => /scribe command:/i.test(l)).map(l => l.replace(/scribe command:\s*/i,"").trim());
+
+// ─── WAVEFORM ─────────────────────────────────────────────────────────────────
+function Waveform({ active, playTime, total=60, height=44 }) {
+  const ref=useRef(null), bars=useRef(Array.from({length:48},()=>Math.random()*0.55+0.15)), frame=useRef(0), raf=useRef(null);
+  useEffect(()=>{
+    const c=ref.current; if(!c) return;
+    const ctx=c.getContext("2d");
+    const draw=()=>{
+      const W=c.parentElement?.offsetWidth||300; c.width=W; c.height=height;
+      ctx.clearRect(0,0,W,height);
+      const bw=W/bars.current.length, pf=total>0&&playTime!=null?playTime/total:-1;
+      bars.current.forEach((h,i)=>{
+        const a=active?Math.min(1,Math.max(0.05,h+Math.sin(frame.current*0.09+i*0.38)*0.28)):h*0.22;
+        const bh=a*height*0.88;
+        ctx.fillStyle=pf>=0&&i/bars.current.length<=pf?"#6366f1":active?`rgba(99,102,241,${0.18+a*0.55})`:"#1e2535";
+        ctx.beginPath(); ctx.roundRect(i*bw+1,(height-bh)/2,Math.max(bw-2,1),bh,2); ctx.fill();
+      });
+      frame.current++; raf.current=requestAnimationFrame(draw);
+    };
+    raf.current=requestAnimationFrame(draw);
+    return ()=>cancelAnimationFrame(raf.current);
+  },[active,playTime,total,height]);
+  return <canvas ref={ref} style={{width:"100%",height,borderRadius:8,background:"#0b0e16",border:"1px solid #1e2535",display:"block"}}/>;
+}
+
+function ScoreRing({score,size=56}){
+  const r=22,c=2*Math.PI*r,d=(score/100)*c,col=score>=80?"#4ade80":score>=60?"#ffb347":"#ff6b6b";
+  return <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+    <svg width={size} height={size} style={{transform:"rotate(-90deg)"}}>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#1e2535" strokeWidth={4}/>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={col} strokeWidth={4} strokeDasharray={`${d} ${c-d}`} strokeLinecap="round" style={{transition:"stroke-dasharray 1s ease"}}/>
+      <text x={size/2} y={size/2} textAnchor="middle" dominantBaseline="central" fill={col} fontSize={12} fontWeight={800} style={{transform:`rotate(90deg)`,transformOrigin:`${size/2}px ${size/2}px`}}>{score}</text>
+    </svg>
+    <span style={{fontSize:9,color:"#475569",textTransform:"uppercase",letterSpacing:"0.06em"}}>Quality</span>
+  </div>;
+}
+
+function Toast({msg,type,onDone}){
+  useEffect(()=>{const t=setTimeout(onDone,3800);return()=>clearTimeout(t);},[]);
+  const c={success:["#071a0f","#166534","#4ade80"],error:["#1a0707","#7f1d1d","#fca5a5"],info:["#06101a","#1e3a5f","#93c5fd"]}[type]||["#06101a","#1e3a5f","#93c5fd"];
+  return <div style={{position:"fixed",bottom:20,right:20,zIndex:9999,background:c[0],border:`1px solid ${c[1]}`,borderRadius:10,padding:"11px 16px",color:c[2],fontSize:13,fontWeight:600,boxShadow:"0 8px 40px rgba(0,0,0,0.7)",maxWidth:320,lineHeight:1.5}}>{msg}</div>;
+}
+
+// ─── SHARED ───────────────────────────────────────────────────────────────────
+const card = (s={}) => ({background:"#111521",border:"1px solid #1e2535",borderRadius:10,...s});
+const btn  = (bg,s={}) => ({padding:"9px 18px",borderRadius:8,border:"none",fontWeight:700,fontSize:13,cursor:"pointer",background:bg,color:"#fff",display:"inline-flex",alignItems:"center",gap:6,...s});
+const ghost = (s={}) => ({padding:"8px 14px",borderRadius:8,border:"1px solid #1e2535",background:"#111521",color:"#94a3b8",fontSize:12,fontWeight:600,cursor:"pointer",...s});
+const inp = (s={}) => ({width:"100%",background:"#0b0e16",border:"1px solid #1e2535",borderRadius:8,padding:"10px 12px",color:"#e2e8f0",fontSize:13,outline:"none",fontFamily:"inherit",boxSizing:"border-box",...s});
+const ta  = (s={}) => ({width:"100%",background:"#0b0e16",border:"1px solid #1e2535",borderRadius:8,padding:"9px 11px",color:"#e2e8f0",fontSize:12.5,fontFamily:"inherit",lineHeight:1.6,resize:"vertical",outline:"none",boxSizing:"border-box",...s});
+const eye = (s={}) => ({fontSize:10,fontWeight:700,letterSpacing:"0.10em",textTransform:"uppercase",color:"#475569",marginBottom:6,...s});
+const ava = (size=38,s={}) => ({width:size,height:size,borderRadius:"50%",background:"linear-gradient(135deg,#4f46e5,#7c3aed)",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:size*0.33,color:"#fff",flexShrink:0,...s});
+
+function Header({clinician,onBack,backLabel,onLogout,onPricing}){
+  return <header style={{background:"#0f1117",borderBottom:"1px solid #161c28",padding:"0 16px",height:52,display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0,gap:8}}>
+    <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+      {onBack&&<button onClick={onBack} style={ghost({padding:"5px 10px",fontSize:11})}>{backLabel||"← Back"}</button>}
+      <span style={{fontSize:18}}>⚕</span>
+      <span style={{fontWeight:800,fontSize:14,color:"#f1f5f9",letterSpacing:"-0.02em"}}>AmbientScribe</span>
+      {DEMO_MODE&&<span style={{fontSize:9,background:"#3d2800",color:"#ffb347",borderRadius:4,padding:"2px 6px",fontWeight:700}}>DEMO</span>}
+    </div>
+    <div style={{display:"flex",alignItems:"center",gap:8}}>
+      {onPricing&&<button onClick={onPricing} style={ghost({fontSize:11,padding:"4px 10px"})}>Pricing</button>}
+      {clinician&&<div style={ava(30)}>{(clinician.fullName||clinician.email||"?").split(" ").map(w=>w[0]).join("").slice(0,2)}</div>}
+      {onLogout&&<button onClick={onLogout} style={ghost({fontSize:11,padding:"4px 9px"})}>Logout</button>}
+      <div style={{display:"flex",alignItems:"center",gap:5,background:"#161c28",borderRadius:20,padding:"3px 9px"}}>
+        <span style={{width:6,height:6,borderRadius:"50%",background:DEMO_MODE?"#ffb347":"#22c55e",display:"inline-block"}}/>
+        <span style={{fontSize:9,color:"#64748b"}}>{DEMO_MODE?"Demo":"Live"}</span>
+      </div>
+    </div>
+  </header>;
+}
+
+// ─── APP ─────────────────────────────────────────────────────────────────────
+export default function App() {
+  const device=useDevice(), isMobile=device==="mobile", isTablet=device==="tablet";
+
+  const [view,setView]             = useState("login");
+  const [token,setToken]           = useState(null);
+  const [clinician,setClinician]   = useState(null);
+  const [loginEmail,setLoginEmail] = useState("");
+  const [loginPass,setLoginPass]   = useState("");
+  const [loginErr,setLoginErr]     = useState("");
+  const [billingCycle,setBillingCycle] = useState("monthly"); // monthly | annual
+
+  const api = useApi(token);
+
+  const [encounter,setEncounter]     = useState(null);
+  const [specialty,setSpecialty]     = useState("general");
+  const [language,setLanguage]       = useState("English");
+  const [consentGiven,setConsentGiven] = useState(false);
+  const [inputMode,setInputMode]     = useState("voice");
+  const [sessionActive,setSessionActive] = useState(false);
+  const [elapsed,setElapsed]         = useState(0);
+  const [typedNote,setTypedNote]     = useState({subjective:"",objective:"",assessment:"",plan:""});
+  const [customTx,setCustomTx]       = useState("");
+  const timerRef = useRef(null);
+
+  const [loading,setLoading]   = useState(false);
+  const [phase,setPhase]       = useState("");
+  const [draft,setDraft]       = useState(null);
+  const [origDraft,setOrigDraft] = useState(null);
+  const [editedDraft,setEditedDraft] = useState(null);
+  const [audit,setAudit]       = useState(null);
+  const [cptData,setCptData]   = useState(null);
+  const [dssData,setDssData]   = useState(null);
+  const [scoreData,setScoreData] = useState(null);
+  const [apiErr,setApiErr]     = useState("");
+  const [styleProfile,setStyleProfile] = useState(null);
+
+  const [editingField,setEditingField] = useState(null);
+  const [override,setOverride] = useState(false);
+  const [signed,setSigned]     = useState(false);
+  const [showPinModal,setShowPinModal] = useState(false);
+  const [signPin,setSignPin]   = useState("");
+  const [signPinErr,setSignPinErr] = useState("");
+  const [playTime,setPlayTime] = useState(null);
+  const [ehrSynced,setEhrSynced] = useState(false);
+  const [savedNoteId,setSavedNoteId] = useState(null);
+
+  const [history,setHistory]   = useState([]);
+  const [shiftStats,setShiftStats] = useState(null);
+  const [toast,setToast]       = useState(null);
+  const [reviewTab,setReviewTab] = useState("soap");
+  const [sidePanel,setSidePanel] = useState("dss");
+  const [takehome,setTakehome] = useState(null);
+  const [thLoading,setThLoading] = useState(false);
+  const [referral,setReferral] = useState(null);
+  const [refLoading,setRefLoading] = useState(false);
+  const [scribeCmds,setScribeCmds] = useState([]);
+
+  const showToast = useCallback((msg,type="info")=>setToast({msg,type}),[]);
+
+  useEffect(()=>{
+    if(sessionActive){timerRef.current=setInterval(()=>setElapsed(s=>s+1),1000);}
+    else clearInterval(timerRef.current);
+    return()=>clearInterval(timerRef.current);
+  },[sessionActive]);
+
+  const totalDur = encounter?.segments?.slice(-1)[0]?.end||60;
+  const conflicts = audit?.conflicts??[];
+  const locked = conflicts.length>0&&!override;
+  const canSign = !loading&&!!audit&&!locked&&!signed;
+  const hasDiff = origDraft&&editedDraft&&Object.keys(SOAP_META).some(k=>(editedDraft[k]||"")!==(origDraft[k]||""));
+
+  // ── Login ──
+  const doLogin = async()=>{
+    setLoginErr("");
+    if(DEMO_MODE){
+      if(!loginEmail||!loginPass){setLoginErr("Enter any email and password.");return;}
+      setClinician({fullName:loginEmail.split("@")[0]||"Demo Doctor",email:loginEmail,role:"provider"});
+      setView("dashboard"); return;
+    }
+    try{
+      const d=await api("POST","/api/v1/auth/login",{email:loginEmail,password:loginPass});
+      setToken(d.token); setClinician(d.user); setView("dashboard");
+    }catch(e){setLoginErr(e.message);}
+  };
+
+  const doLogout=()=>{setToken(null);setClinician(null);setHistory([]);setView("login");};
+
+  // ── Pick encounter ──
+  const pickEncounter=async enc=>{
+    setEncounter(enc); setSpecialty(enc.specialty); setConsentGiven(false);
+    setInputMode("voice"); setSessionActive(false); setElapsed(0);
+    setDraft(null); setOrigDraft(null); setEditedDraft(null);
+    setAudit(null); setCptData(null); setDssData(null); setScoreData(null);
+    setApiErr(""); setPhase(""); setOverride(false); setSigned(false);
+    setShowPinModal(false); setSignPin(""); setSignPinErr("");
+    setPlayTime(null); setEhrSynced(false); setSavedNoteId(null);
+    setTakehome(null); setReferral(null); setScribeCmds([]);
+    setTypedNote({subjective:"",objective:"",assessment:"",plan:""});
+    setCustomTx(""); setReviewTab("soap"); setSidePanel("dss"); setStyleProfile(null);
+    if(!DEMO_MODE&&token){
+      try{const sp=await api("GET","/api/v1/notes/style-profile");if(sp.success&&sp.hasProfile)setStyleProfile(sp.profile);}catch{}
+    }
+    setView("session");
+  };
+
+  // ── Pipeline ──
+  const runPipeline=async()=>{
+    const srcText=inputMode==="type"
+      ?Object.entries(typedNote).filter(([,v])=>v.trim()).map(([k,v])=>`[${k.toUpperCase()}]: ${v}`).join("\n")
+      :customTx.trim()||encounter.transcript;
+    if(!srcText.trim()){showToast("Nothing to process.","error");return;}
+    setScribeCmds(extractCmds(encounter.transcript));
+    setLoading(true); setApiErr(""); setView("review");
+    try{
+      let soap;
+      if(inputMode==="type"){
+        soap={...typedNote};
+        Object.keys(SOAP_META).forEach(k=>{if(!soap[k])soap[k]="Not documented.";});
+      }else{
+        const styleBlock=styleProfile?`\n\n${styleProfile}`:"";
+        setPhase("Pass 1 — Generating SOAP draft…");
+        soap=await claudeJSON(`You are a clinical documentation specialist. Extract a SOAP note ONLY from explicitly stated facts in this ${SPECIALTIES.find(s=>s.id===specialty)?.label||specialty} consultation. Each value is one concise paragraph. Output language: ${language}.${styleBlock}\nReturn ONLY JSON: {"subjective":"...","objective":"...","assessment":"...","plan":"..."}`,srcText);
+      }
+      setDraft(soap); setOrigDraft(soap); setEditedDraft({...soap});
+
+      setPhase("Pass 2 — CMO safety audit…");
+      const aud=await claudeJSON(`You are a Chief Medical Officer safety auditor. Find: (1) allergy violations — drug belongs to same class as stated allergy e.g. Amoxicillin IS penicillin-class; (2) exam/diagnosis contradictions. Patient allergies: ${encounter.allergies.length?encounter.allergies.join(", "):"None"}. Return ONLY JSON: {"conflicts":[{"severity":"CRITICAL|WARNING|INFO","target_section":"...","description":"...","resolution_suggestion":"...","transcript_quote":"short phrase"}],"audit_passed":true|false}`,`Transcript:\n${srcText}\n\nSOAP:\n${JSON.stringify(soap)}`);
+      setAudit(aud);
+
+      setPhase("Pass 3 — CPT billing codes…");
+      const cpt=await claudeJSON(`Medical billing specialist. Suggest 3 CPT codes. Return ONLY JSON: {"codes":[{"code":"XXXXX","description":"...","confidence":"high|medium|low","rationale":"one sentence","fee_range":"$X–$Y"}]}`,JSON.stringify(soap));
+      setCptData(cpt);
+
+      setPhase("Pass 4 — Clinical decision support…");
+      const dss=await claudeJSON(`Clinical decision support AI for ${specialty}. Return ONLY JSON: {"suggestions":[{"type":"guideline|drug_interaction|red_flag|follow_up","priority":"high|medium|low","title":"...","body":"...","source":"..."}]}`,JSON.stringify(soap));
+      setDssData(dss);
+
+      setPhase("Pass 5 — Note quality score…");
+      const sc=await claudeJSON(`Score this SOAP note 0–100. Return ONLY JSON: {"score":0,"breakdown":{"completeness":0,"specificity":0,"accuracy":0,"billing_readiness":0},"feedback":["tip"]}`,`Transcript:\n${srcText}\n\nSOAP:\n${JSON.stringify(soap)}`);
+      setScoreData(sc);
+
+      if(!DEMO_MODE&&token){
+        setPhase("Saving to server…");
+        try{
+          const saved=await api("POST","/api/v1/notes",{patientName:encounter.patientName,mrn:encounter.mrn,patientDob:encounter.dob,patientAge:encounter.age,gender:encounter.gender,allergies:encounter.allergies,specialty,chiefComplaint:encounter.cc,language,inputMode,soapAiGenerated:soap,soapFinal:soap,auditPassed:aud.audit_passed,conflicts:aud.conflicts||[],overrideUsed:false,cptCodes:cpt.codes||[],qualityScore:sc.score,qualityBreakdown:sc.breakdown});
+          if(saved.success)setSavedNoteId(saved.note.id);
+        }catch(e){showToast("Pipeline done — server save failed. Working offline.","error");}
+      }
+      setPhase("");
+      setHistory(h=>[{id:Date.now(),encId:encounter.id,patient:encounter.patientName,mrn:encounter.mrn,badge:encounter.badge,time:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),conflicts:(aud.conflicts||[]).length,signed:false,score:sc?.score},...h.slice(0,19)]);
+    }catch(e){setApiErr(e.message||"Pipeline error.");setPhase("");}
+    finally{setLoading(false);}
+  };
+
+  const endSession=()=>{if(!consentGiven){showToast("Record patient consent first.","error");return;}setSessionActive(false);runPipeline();};
+
+  // ── Sign ──
+  const doSign=async()=>{
+    if(DEMO_MODE){if(!signPin){setSignPinErr("Enter any PIN.");return;}setSigned(true);setShowPinModal(false);setHistory(h=>h.map((x,i)=>i===0?{...x,signed:true}:x));showToast("✅ Note signed & locked (demo).","success");return;}
+    try{await api("POST","/api/v1/auth/login",{email:clinician.email,password:signPin});}catch{setSignPinErr("Incorrect PIN.");return;}
+    if(savedNoteId){try{await api("PATCH",`/api/v1/notes/${savedNoteId}/sign`,{soapFinal:editedDraft,overrideUsed:override});}catch{showToast("Signed locally — sync failed.","error");}}
+    setSigned(true);setShowPinModal(false);setHistory(h=>h.map((x,i)=>i===0?{...x,signed:true}:x));showToast("✅ Note signed, sealed & saved to server.","success");
+  };
+
+  const scrub=q=>{if(!q||!encounter?.segments)return;const seg=encounter.segments.find(s=>s.text.toLowerCase().includes(q.toLowerCase().slice(0,20)));const t=seg?seg.start:0;setPlayTime(t);showToast(`⏱ Jumped to ${fmt(t)} in recording`,"info");};
+
+  const stats={totalSessions:history.length,signed:history.filter(x=>x.signed).length,totalConflicts:history.reduce((a,x)=>a+(x.conflicts||0),0),avgScore:history.filter(x=>x.score).length?Math.round(history.filter(x=>x.score).reduce((a,x)=>a+x.score,0)/history.filter(x=>x.score).length):null};
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // VIEW: LOGIN
+  // ═══════════════════════════════════════════════════════════════════════════
+  if(view==="login") return(
+    <div style={{fontFamily:"'Inter',system-ui,sans-serif",background:"#0b0e16",minHeight:"100vh",color:"#e2e8f0",display:"flex",flexDirection:"column"}}>
+      <Header onPricing={()=>setView("pricing")}/>
+      <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+        <div style={{width:"100%",maxWidth:420}}>
+          {DEMO_MODE&&<div style={{background:"#3d2800",border:"1px solid #78350f",borderRadius:10,padding:"12px 16px",marginBottom:16,fontSize:12,color:"#fcd34d",lineHeight:1.5}}><strong>Demo mode</strong> — Claude API calls are fully live. Set <code style={{background:"#00000030",padding:"1px 4px",borderRadius:3}}>BACKEND_URL</code> at top of file to connect your backend.</div>}
+          <div style={card({padding:isMobile?"24px 20px":"32px 28px"})}>
+            <div style={{textAlign:"center",marginBottom:28}}>
+              <div style={{fontSize:44,marginBottom:8}}>⚕</div>
+              <h1 style={{fontSize:22,fontWeight:800,color:"#f1f5f9",margin:"0 0 4px",letterSpacing:"-0.03em"}}>AmbientScribe AI</h1>
+              <p style={{fontSize:11,color:"#475569",margin:0,textTransform:"uppercase",letterSpacing:"0.06em"}}>Secure Clinician Portal · v2.0</p>
+            </div>
+            <div style={{marginBottom:12}}>
+              <div style={eye()}>Email</div>
+              <input value={loginEmail} onChange={e=>setLoginEmail(e.target.value)} placeholder={DEMO_MODE?"any@email.com":"doctor@clinic.com"} style={inp()} onKeyDown={e=>e.key==="Enter"&&doLogin()}/>
+            </div>
+            <div style={{marginBottom:14}}>
+              <div style={eye()}>Password</div>
+              <input type="password" value={loginPass} onChange={e=>setLoginPass(e.target.value)} placeholder="••••••••" style={inp()} onKeyDown={e=>e.key==="Enter"&&doLogin()}/>
+            </div>
+            {loginErr&&<div style={{background:"#1a0707",border:"1px solid #7f1d1d",borderRadius:7,padding:"9px 13px",color:"#fca5a5",fontSize:12,marginBottom:12}}>{loginErr}</div>}
+            <button onClick={doLogin} style={btn("linear-gradient(135deg,#4f46e5,#7c3aed)",{width:"100%",justifyContent:"center",marginBottom:12})}>{DEMO_MODE?"Enter Demo →":"Log in securely →"}</button>
+            <button onClick={()=>setView("pricing")} style={{background:"transparent",border:"none",color:"#6366f1",fontSize:12,cursor:"pointer",width:"100%",textDecoration:"underline"}}>View pricing — 3-day free trial →</button>
+          </div>
+        </div>
+      </div>
+      {toast&&<Toast msg={toast.msg} type={toast.type} onDone={()=>setToast(null)}/>}
+      <CSS/>
+    </div>
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // VIEW: PRICING
+  // ═══════════════════════════════════════════════════════════════════════════
+  if(view==="pricing") return(
+    <div style={{fontFamily:"'Inter',system-ui,sans-serif",background:"#0b0e16",minHeight:"100vh",color:"#e2e8f0",display:"flex",flexDirection:"column"}}>
+      <Header onBack={()=>setView("login")} backLabel="← Back"/>
+      <div style={{flex:1,overflowY:"auto",padding:isMobile?"16px":"36px 24px"}}>
+        <div style={{maxWidth:1020,margin:"0 auto"}}>
+
+          {/* Hero */}
+          <div style={{textAlign:"center",marginBottom:36}}>
+            <div style={{display:"inline-flex",alignItems:"center",gap:8,background:"#13152a",border:"1px solid #4f46e5",borderRadius:20,padding:"6px 16px",marginBottom:16}}>
+              <span style={{fontSize:13}}>⚕</span>
+              <span style={{fontSize:12,color:"#818cf8",fontWeight:600}}>AmbientScribe AI · Clinical Documentation Platform</span>
+            </div>
+            <h1 style={{fontSize:isMobile?24:34,fontWeight:800,color:"#f1f5f9",margin:"0 0 10px",letterSpacing:"-0.03em"}}>The only AI scribe that checks its own work</h1>
+            <p style={{fontSize:14,color:"#64748b",maxWidth:540,margin:"0 auto 20px"}}>CMO-grade safety audit on every note. Style learning that writes exactly like you. 3-day free trial — no card required.</p>
+
+            {/* Billing cycle toggle */}
+            <div style={{display:"inline-flex",alignItems:"center",gap:4,background:"#111521",border:"1px solid #1e2535",borderRadius:10,padding:4}}>
+              {["monthly","annual"].map(c=>(
+                <button key={c} onClick={()=>setBillingCycle(c)} style={{padding:"7px 18px",borderRadius:7,border:"none",background:billingCycle===c?"#4f46e5":"transparent",color:billingCycle===c?"#fff":"#64748b",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+                  {c==="annual"?"Annual (save 20%)":"Monthly"}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* ROI banner */}
+          <div style={{...card({padding:"16px 20px",background:"#0d1520",borderColor:"#1e3a5f",marginBottom:28}),display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+            <span style={{fontSize:24}}>💡</span>
+            <div>
+              <div style={{fontWeight:700,fontSize:13,color:"#93c5fd"}}>The ROI case — in one sentence</div>
+              <div style={{fontSize:12,color:"#64748b",marginTop:2}}>A human medical scribe costs <strong style={{color:"#e2e8f0"}}>$3,750–$5,400/month</strong> per provider. AmbientScribe Clinical Pro is <strong style={{color:"#4ade80"}}>$300/month</strong>. That's a saving of up to <strong style={{color:"#4ade80"}}>$5,100 every month.</strong></div>
+            </div>
+          </div>
+
+          {/* Plan cards */}
+          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":isTablet?"1fr 1fr":"repeat(4,1fr)",gap:14,marginBottom:40}}>
+            {PLANS.map(plan=>{
+              const price=billingCycle==="annual"&&plan.annualPrice!=null?plan.annualPrice:plan.monthlyPrice;
+              return(
+                <div key={plan.id} style={{...card(),padding:"22px 18px",border:`2px solid ${plan.badge?"#4f46e5":"#1e2535"}`,position:"relative",display:"flex",flexDirection:"column"}}>
+                  {plan.badge&&<div style={{position:"absolute",top:-12,left:"50%",transform:"translateX(-50%)",background:"linear-gradient(135deg,#4f46e5,#7c3aed)",color:"#fff",fontSize:9,fontWeight:800,padding:"3px 12px",borderRadius:20,whiteSpace:"nowrap",letterSpacing:"0.06em"}}>{plan.badge}</div>}
+                  <div style={{marginBottom:14}}>
+                    <div style={{fontSize:11,fontWeight:700,color:plan.accent,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6}}>{plan.name}</div>
+                    <div style={{display:"flex",alignItems:"baseline",gap:3,marginBottom:3}}>
+                      {price===0
+                        ?<span style={{fontSize:30,fontWeight:800,color:"#f1f5f9"}}>Free</span>
+                        :<><span style={{fontSize:30,fontWeight:800,color:"#f1f5f9"}}>${price}</span><span style={{fontSize:11,color:"#64748b"}}>/mo</span></>
+                      }
+                    </div>
+                    <div style={{fontSize:10,color:"#64748b"}}>{plan.period}</div>
+                    {billingCycle==="annual"&&plan.annualPrice&&<div style={{fontSize:10,color:"#4ade80",marginTop:2}}>Billed ${plan.annualPrice*12}/year</div>}
+                    {plan.trialDays>0&&<div style={{fontSize:10,color:"#ffb347",marginTop:3}}>✦ {plan.trialDays}-day free trial — no card required</div>}
+                  </div>
+                  <ul style={{margin:"0 0 18px",paddingLeft:0,listStyle:"none",flex:1,display:"flex",flexDirection:"column",gap:7}}>
+                    {plan.features.map((f,i)=>(
+                      <li key={i} style={{display:"flex",gap:7,alignItems:"flex-start",fontSize:11,color:"#cbd5e1"}}>
+                        <span style={{color:plan.accent,flexShrink:0,marginTop:1}}>✓</span>{f}
+                      </li>
+                    ))}
+                  </ul>
+                  <button onClick={()=>setView("login")} style={btn(plan.badge?"linear-gradient(135deg,#4f46e5,#7c3aed)":"#1e2535",{justifyContent:"center",width:"100%",color:plan.badge?"#fff":"#94a3b8",fontSize:12})}>
+                    {plan.cta}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Competitor comparison */}
+          <div style={card({padding:"22px 20px",marginBottom:32})}>
+            <h3 style={{fontSize:15,fontWeight:800,color:"#f1f5f9",margin:"0 0 16px"}}>How we compare to the market</h3>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead>
+                  <tr>{["Platform","Price/mo","Safety Audit","CPT Codes","DSS","Style Learning","Free Tier"].map(h=>(
+                    <th key={h} style={{textAlign:"left",padding:"8px 10px",color:"#64748b",borderBottom:"1px solid #1e2535",whiteSpace:"nowrap",fontWeight:600}}>{h}</th>
+                  ))}</tr>
+                </thead>
+                <tbody>
+                  {[
+                    {name:"AmbientScribe ✦",price:"Free – $450",audit:"✓",cpt:"✓",dss:"✓",style:"✓",free:"✓",us:true},
+                    {name:"Freed AI",        price:"$39–$119",  audit:"✗",cpt:"✗",dss:"✗",style:"✗",free:"✓",us:false},
+                    {name:"Nabla",           price:"~$119",     audit:"✗",cpt:"✗",dss:"✓",style:"✗",free:"✓",us:false},
+                    {name:"Suki AI",         price:"$299–$399", audit:"✗",cpt:"✗",dss:"✗",style:"✗",free:"✗",us:false},
+                    {name:"Nuance DAX",      price:"~$600",     audit:"✗",cpt:"✗",dss:"✗",style:"✗",free:"✗",us:false},
+                    {name:"Abridge",         price:"$400–$600", audit:"✗",cpt:"✗",dss:"✗",style:"✗",free:"✗",us:false},
+                  ].map(row=>(
+                    <tr key={row.name} style={{background:row.us?"#13152a":"transparent",borderBottom:"1px solid #161c28"}}>
+                      <td style={{padding:"9px 10px",color:row.us?"#a5b4fc":"#cbd5e1",fontWeight:row.us?700:400}}>{row.name}</td>
+                      <td style={{padding:"9px 10px",color:"#94a3b8"}}>{row.price}</td>
+                      {[row.audit,row.cpt,row.dss,row.style,row.free].map((v,i)=>(
+                        <td key={i} style={{padding:"9px 10px",color:v==="✗"?"#334155":"#4ade80",fontWeight:600,fontSize:14}}>{v}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Compliance */}
+          <div style={card({padding:"22px 20px",marginBottom:28})}>
+            <h3 style={{fontSize:15,fontWeight:800,color:"#f1f5f9",margin:"0 0 16px"}}>Security, compliance & legal</h3>
+            <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"repeat(3,1fr)",gap:12,marginBottom:18}}>
+              {[
+                {icon:"🔒",title:"HIPAA Compliant",body:"End-to-end encryption of all PHI. BAA available on all paid plans. Audio deleted after note generation."},
+                {icon:"🛡",title:"SOC 2 Type II",body:"Annual third-party security audits. Controls map directly to HIPAA Technical Safeguards."},
+                {icon:"📋",title:"Audit Logs",body:"Complete immutable audit trail of every note, edit, conflict override, and EHR push."},
+                {icon:"🚫",title:"Zero Data Retention",body:"Patient data is never used to train AI models. Nothing stored after session ends."},
+                {icon:"⚖",title:"Clinician Liability",body:"AI-generated notes must be reviewed and approved by a licensed clinician. Override checkbox transfers liability explicitly."},
+                {icon:"🌐",title:"FHIR R4",body:"Enterprise plans push notes directly to Epic and Cerner via HL7 FHIR R4. Manual export on all other plans."},
+              ].map(({icon,title,body})=>(
+                <div key={title} style={card({padding:"13px",background:"#0d0f18",borderColor:"#161c28"})}>
+                  <div style={{fontSize:20,marginBottom:5}}>{icon}</div>
+                  <div style={{fontSize:12,fontWeight:700,color:"#e2e8f0",marginBottom:3}}>{title}</div>
+                  <div style={{fontSize:11,color:"#64748b",lineHeight:1.5}}>{body}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{background:"#0d1520",border:"1px solid #1e3a5f",borderRadius:8,padding:"13px 15px"}}>
+              <div style={eye({marginBottom:7})}>Legal notices</div>
+              <ul style={{margin:0,paddingLeft:16,display:"flex",flexDirection:"column",gap:5}}>
+                {["Patient consent is required before every session. Two-party consent states require explicit agreement before any recording.","AI-generated notes must be reviewed by a licensed clinician before becoming part of the medical record.","AmbientScribe is an administrative documentation tool, not a medical device (FDA exempted).","A signed BAA is required before any PHI processing. Available instantly on all paid plans."].map((item,i)=>(
+                  <li key={i} style={{fontSize:11,color:"#64748b",lineHeight:1.5}}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+          <div style={{textAlign:"center",paddingBottom:20}}>
+            <button onClick={()=>setView("login")} style={btn("linear-gradient(135deg,#4f46e5,#7c3aed)",{fontSize:14,padding:"12px 28px"})}>Start 3-day free trial — no card required</button>
+          </div>
+        </div>
+      </div>
+      <CSS/>
+    </div>
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // VIEW: DASHBOARD
+  // ═══════════════════════════════════════════════════════════════════════════
+  if(view==="dashboard") return(
+    <div style={{fontFamily:"'Inter',system-ui,sans-serif",background:"#0b0e16",minHeight:"100vh",color:"#e2e8f0",display:"flex",flexDirection:"column"}}>
+      <Header clinician={clinician} onLogout={doLogout} onPricing={()=>setView("pricing")}/>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"220px 1fr",flex:1,overflow:"hidden"}}>
+        {!isMobile&&<aside style={{borderRight:"1px solid #161c28",padding:"16px 13px",overflowY:"auto",display:"flex",flexDirection:"column",gap:10}}>
+          <div style={card({padding:"14px",background:"#0d0f18",borderColor:"#161c28"})}>
+            <div style={eye()}>Shift stats</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+              {[{l:"Sessions",v:stats.totalSessions},{l:"Signed",v:stats.signed},{l:"Conflicts",v:stats.totalConflicts},{l:"Avg score",v:stats.avgScore||"—"}].map(({l,v})=>(
+                <div key={l} style={card({padding:"10px",textAlign:"center",background:"#111521"})}>
+                  <div style={{fontSize:18,fontWeight:800,color:"#e2e8f0"}}>{v}</div>
+                  <div style={{fontSize:10,color:"#475569"}}>{l}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div style={eye()}>Session history</div>
+          {history.length===0?<p style={{fontSize:12,color:"#334155"}}>No sessions yet.</p>
+            :history.map((s,i)=>{const b=BADGE[s.badge]||BADGE.PASS;return(
+              <div key={s.id} style={card({padding:"10px 12px",background:"#0d0f18",borderColor:"#161c28",display:"flex",flexDirection:"column",gap:3})}>
+                <div style={{display:"flex",justifyContent:"space-between"}}>
+                  <span style={{fontSize:12,fontWeight:600,color:"#e2e8f0",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.patient}</span>
+                  <span style={{fontSize:9,fontWeight:700,padding:"1px 6px",borderRadius:10,background:b.bg,color:b.color,flexShrink:0}}>{b.label}</span>
+                </div>
+                <span style={{fontSize:10,color:"#64748b"}}>{s.mrn} · {s.time}</span>
+                <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:2}}>
+                  {s.conflicts>0&&<span style={{fontSize:9,background:"#3d0e0e",color:"#ff6b6b",borderRadius:4,padding:"1px 5px"}}>{s.conflicts}⚠</span>}
+                  {s.signed&&<span style={{fontSize:9,background:"#0e2a1a",color:"#4ade80",borderRadius:4,padding:"1px 5px"}}>✓ Signed</span>}
+                  {s.score&&<span style={{fontSize:9,background:"#13152a",color:"#818cf8",borderRadius:4,padding:"1px 5px"}}>Q:{s.score}</span>}
+                </div>
+              </div>
+            );})}
+        </aside>}
+        <main style={{padding:isMobile?"12px":"24px",overflowY:"auto"}}>
+          <div style={{marginBottom:20}}>
+            <h2 style={{fontSize:isMobile?18:20,fontWeight:800,color:"#f1f5f9",margin:"0 0 3px",letterSpacing:"-0.02em"}}>Good {new Date().getHours()<12?"morning":"afternoon"}, {(clinician?.fullName||clinician?.email||"Doctor").split(" ")[0]}</h2>
+            <p style={{fontSize:12,color:"#475569",margin:0}}>{clinician?.role||"Provider"} · Select a patient encounter to begin</p>
+          </div>
+          {isMobile&&<div style={{display:"flex",gap:8,marginBottom:16,overflowX:"auto"}}>
+            {[{l:"Sessions",v:stats.totalSessions},{l:"Signed",v:stats.signed},{l:"Conflicts",v:stats.totalConflicts}].map(({l,v})=>(
+              <div key={l} style={card({padding:"10px 14px",flexShrink:0,textAlign:"center"})}>
+                <div style={{fontSize:18,fontWeight:800}}>{v}</div>
+                <div style={{fontSize:10,color:"#475569"}}>{l}</div>
+              </div>
+            ))}
+          </div>}
+          <div style={eye({marginBottom:10})}>Today's patient encounters</div>
+          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":isTablet?"1fr 1fr":"repeat(3,1fr)",gap:12}}>
+            {ENCOUNTERS.map(enc=>{const b=BADGE[enc.badge];return(
+              <button key={enc.id} onClick={()=>pickEncounter(enc)}
+                style={{...card(),padding:"16px",cursor:"pointer",textAlign:"left",display:"flex",flexDirection:"column",transition:"border-color 0.15s"}}
+                onMouseEnter={e=>e.currentTarget.style.borderColor="#4f46e5"}
+                onMouseLeave={e=>e.currentTarget.style.borderColor="#1e2535"}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+                  <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:12,background:b.bg,color:b.color}}>{b.label}</span>
+                </div>
+                <div style={{fontWeight:700,fontSize:14,color:"#e2e8f0",marginBottom:3}}>{enc.patientName}</div>
+                <div style={{fontSize:11,color:"#64748b",marginBottom:1}}>{enc.mrn} · Age {enc.age} · {enc.gender}</div>
+                <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>CC: {enc.cc}</div>
+                <div style={{fontSize:11,color:"#6366f1",fontWeight:600,marginBottom:6}}>{SPECIALTIES.find(s=>s.id===enc.specialty)?.icon} {enc.specialty}</div>
+                {enc.allergies.length>0&&<div style={{fontSize:10,color:"#f87171",background:"#1a0707",borderRadius:4,padding:"2px 7px",display:"inline-block"}}>⚠ {enc.allergies.join(", ")}</div>}
+                <div style={{fontSize:11,color:"#4f46e5",marginTop:10,fontWeight:600}}>Open session →</div>
+              </button>
+            );})}
+          </div>
+        </main>
+      </div>
+      {toast&&<Toast msg={toast.msg} type={toast.type} onDone={()=>setToast(null)}/>}
+      <CSS/>
+    </div>
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // VIEW: SESSION
+  // ═══════════════════════════════════════════════════════════════════════════
+  if(view==="session") return(
+    <div style={{fontFamily:"'Inter',system-ui,sans-serif",background:"#0b0e16",minHeight:"100vh",color:"#e2e8f0",display:"flex",flexDirection:"column"}}>
+      <Header clinician={clinician} onBack={()=>setView("dashboard")} backLabel="← Dashboard" onLogout={doLogout}/>
+      <div style={{flex:1,overflowY:"auto",padding:isMobile?"12px":"24px",display:"flex",justifyContent:"center"}}>
+        <div style={{width:"100%",maxWidth:680,display:"flex",flexDirection:"column",gap:12}}>
+          {/* Patient */}
+          <div style={card({padding:"14px 16px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"})}>
+            <div style={ava()}>{encounter.patientName.split(" ").map(w=>w[0]).join("")}</div>
+            <div style={{flex:1,minWidth:160}}>
+              <div style={{fontWeight:700,fontSize:15,color:"#f1f5f9"}}>{encounter.patientName}</div>
+              <div style={{fontSize:11,color:"#64748b",marginTop:1}}>{encounter.mrn} · Age {encounter.age} · {encounter.gender}</div>
+              <div style={{fontSize:11,color:"#94a3b8"}}>CC: {encounter.cc}</div>
+              {encounter.allergies.length>0&&<div style={{fontSize:10,color:"#f87171",marginTop:2}}>⚠ {encounter.allergies.join(", ")}</div>}
+            </div>
+            {styleProfile&&<div style={{fontSize:10,background:"#0e2a1a",border:"1px solid #166534",borderRadius:6,padding:"4px 8px",color:"#4ade80"}}>🧠 Style learned</div>}
+            <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:12,background:BADGE[encounter.badge].bg,color:BADGE[encounter.badge].color}}>{BADGE[encounter.badge].label}</span>
+          </div>
+          {/* Config */}
+          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"1fr 1fr 1fr",gap:10}}>
+            <div style={card({padding:"12px 13px"})}><div style={eye()}>Specialty</div>
+              <select value={specialty} onChange={e=>setSpecialty(e.target.value)} style={{width:"100%",background:"#0b0e16",border:"1px solid #1e2535",borderRadius:7,padding:"7px 9px",color:"#e2e8f0",fontSize:12,outline:"none"}}>
+                {SPECIALTIES.map(s=><option key={s.id} value={s.id}>{s.icon} {s.label}</option>)}
+              </select>
+            </div>
+            <div style={card({padding:"12px 13px"})}><div style={eye()}>Language</div>
+              <select value={language} onChange={e=>setLanguage(e.target.value)} style={{width:"100%",background:"#0b0e16",border:"1px solid #1e2535",borderRadius:7,padding:"7px 9px",color:"#e2e8f0",fontSize:12,outline:"none"}}>
+                {["English","Spanish","French","German","Portuguese","Mandarin"].map(l=><option key={l}>{l}</option>)}
+              </select>
+            </div>
+            <div style={card({padding:"12px 13px",gridColumn:isMobile?"1 / -1":"auto"})}><div style={eye()}>Input mode</div>
+              <div style={{display:"flex",gap:4}}>
+                {[{id:"voice",l:"🎙 Voice"},{id:"type",l:"⌨️ Type"},{id:"both",l:"⚡ Both"}].map(m=>(
+                  <button key={m.id} onClick={()=>setInputMode(m.id)} style={{flex:1,padding:"7px 4px",borderRadius:7,border:`1px solid ${inputMode===m.id?"#6366f1":"#1e2535"}`,background:inputMode===m.id?"#13152a":"#0b0e16",color:inputMode===m.id?"#a5b4fc":"#475569",fontSize:11,fontWeight:700,cursor:"pointer"}}>{m.l}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+          {/* Consent */}
+          <div style={{...card({padding:"12px 16px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}),background:consentGiven?"#071a0f":"#0d1520",borderColor:consentGiven?"#166534":"#1e3a5f"}}>
+            <span style={{fontSize:18}}>{consentGiven?"✅":"🔒"}</span>
+            <div style={{flex:1}}><div style={{fontSize:12,fontWeight:700,color:consentGiven?"#4ade80":"#93c5fd"}}>{consentGiven?"Patient consent recorded — HIPAA §164.506":"Patient consent required before recording"}</div><div style={{fontSize:11,color:"#64748b"}}>Patient must be verbally informed this visit will be AI-transcribed.</div></div>
+            {!consentGiven&&<button onClick={()=>setConsentGiven(true)} style={btn("#1e3a5f",{color:"#93c5fd",fontSize:11,padding:"6px 12px",whiteSpace:"nowrap"})}>✓ Consent Given</button>}
+          </div>
+          {/* Voice */}
+          {(inputMode==="voice"||inputMode==="both")&&(
+            <div style={card({padding:"14px 16px",borderColor:sessionActive?"#166534":"#1e2535",transition:"border-color 0.3s"})}>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                <div style={{width:10,height:10,borderRadius:"50%",background:sessionActive?"#4ade80":"#334155",animation:sessionActive?"blink 1s infinite":"none"}}/>
+                <span style={{fontSize:13,fontWeight:600,color:sessionActive?"#4ade80":"#475569"}}>{sessionActive?`Ambient listening · ${fmt(elapsed)}`:"Microphone standby"}</span>
+                {sessionActive&&<span style={{marginLeft:"auto",background:"#7f1d1d",color:"#fca5a5",fontSize:10,fontWeight:800,padding:"3px 8px",borderRadius:4,animation:"blink 1.2s infinite"}}>● REC</span>}
+              </div>
+              <Waveform active={sessionActive} playTime={null} total={totalDur}/>
+              {sessionActive&&extractCmds(encounter.transcript).length>0&&<div style={{marginTop:10}}><div style={eye()}>Scribe commands intercepted</div>{extractCmds(encounter.transcript).map((c,i)=><div key={i} style={{fontSize:11,color:"#93c5fd",background:"#0a1829",borderRadius:6,padding:"6px 10px",marginBottom:5,fontFamily:"monospace"}}>🎙 {c}</div>)}</div>}
+              <details style={{marginTop:10}}><summary style={{fontSize:11,color:"#475569",cursor:"pointer"}}>Custom transcript override</summary><textarea value={customTx} onChange={e=>setCustomTx(e.target.value)} placeholder="Paste a custom transcript…" rows={3} style={ta({marginTop:8,fontSize:11})}/></details>
+            </div>
+          )}
+          {/* Type */}
+          {(inputMode==="type"||inputMode==="both")&&(
+            <div style={card({padding:"14px 16px"})}>
+              <div style={eye({marginBottom:10})}>⌨️ Manual SOAP entry</div>
+              <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:10}}>
+                {Object.entries(SOAP_META).map(([k,m])=>(
+                  <div key={k}>
+                    <div style={{fontSize:10,fontWeight:700,color:m.color,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>{m.label}</div>
+                    <textarea value={typedNote[k]} onChange={e=>setTypedNote(n=>({...n,[k]:e.target.value}))} placeholder={m.hint} rows={3} style={ta({borderColor:typedNote[k]?m.color+"44":"#1e2535"})}/>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* Controls */}
+          <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+            {inputMode!=="type"&&(!sessionActive
+              ?<button onClick={()=>{if(!consentGiven){showToast("Record patient consent first.","error");return;}setSessionActive(true);setElapsed(0);}} style={btn("linear-gradient(135deg,#059669,#10b981)",{flex:1,justifyContent:"center"})}>▶ Start Session</button>
+              :<button onClick={endSession} style={btn("linear-gradient(135deg,#dc2626,#ef4444)",{flex:1,justifyContent:"center"})}>⏹ End Session &amp; Run Pipeline</button>
+            )}
+            {(inputMode==="type"||inputMode==="both")&&!sessionActive&&(
+              <button onClick={()=>{if(!consentGiven){showToast("Record consent first.","error");return;}inputMode==="type"?runPipeline():endSession();}} style={btn("linear-gradient(135deg,#4f46e5,#7c3aed)",{flex:1,justifyContent:"center"})}>⚡ Submit Note</button>
+            )}
+          </div>
+        </div>
+      </div>
+      {toast&&<Toast msg={toast.msg} type={toast.type} onDone={()=>setToast(null)}/>}
+      <CSS/>
+    </div>
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // VIEW: REVIEW
+  // ═══════════════════════════════════════════════════════════════════════════
+  if(view==="review") return(
+    <div style={{fontFamily:"'Inter',system-ui,sans-serif",background:"#0b0e16",minHeight:"100vh",color:"#e2e8f0",display:"flex",flexDirection:"column"}}>
+      <Header clinician={clinician} onBack={()=>setView("dashboard")} backLabel="← Dashboard" onLogout={doLogout}/>
+      <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"240px 1fr",flex:1,overflow:"hidden"}}>
+        {!isMobile&&<aside style={{borderRight:"1px solid #161c28",padding:"14px 12px",overflowY:"auto",display:"flex",flexDirection:"column",gap:12}}>
+          <div style={card({padding:"10px 12px",display:"flex",alignItems:"center",gap:10,background:"#0d0f18",borderColor:"#161c28"})}>
+            <div style={ava(32)}>{encounter.patientName.split(" ").map(w=>w[0]).join("")}</div>
+            <div style={{flex:1,minWidth:0}}><div style={{fontSize:12,fontWeight:700,color:"#f1f5f9",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{encounter.patientName}</div><div style={{fontSize:10,color:"#64748b"}}>{encounter.mrn}</div></div>
+            {scoreData&&<ScoreRing score={scoreData.score} size={48}/>}
+          </div>
+          <div><div style={eye()}>Audio timeline</div><Waveform active={false} playTime={playTime} total={totalDur}/>{playTime!=null&&<div style={{fontSize:11,color:"#6366f1",marginTop:5,fontWeight:600}}>⏱ At {fmt(playTime)}</div>}</div>
+          <div style={{display:"flex",gap:3}}>
+            {[{id:"dss",l:"🧠 DSS"},{id:"cpt",l:"💳 CPT"},{id:"segments",l:"📍 Audio"}].map(p=>(
+              <button key={p.id} onClick={()=>setSidePanel(p.id)} style={{flex:1,padding:"5px",borderRadius:6,border:`1px solid ${sidePanel===p.id?"#6366f1":"#1e2535"}`,background:sidePanel===p.id?"#13152a":"#0b0e16",color:sidePanel===p.id?"#a5b4fc":"#475569",fontSize:10,fontWeight:700,cursor:"pointer"}}>{p.l}</button>
+            ))}
+          </div>
+          {sidePanel==="dss"&&(dssData?.suggestions?.length>0?dssData.suggestions.map((s,i)=>(
+            <div key={i} style={card({padding:"10px 12px",background:"#0d1520",borderColor:s.priority==="high"?"#7f1d1d":"#1e2535"})}>
+              <div style={{display:"flex",gap:5,alignItems:"center",marginBottom:4}}>
+                <span style={{fontSize:9,fontWeight:800,padding:"1px 6px",borderRadius:4,background:s.priority==="high"?"#7f1d1d":s.priority==="medium"?"#78350f":"#1e2535",color:s.priority==="high"?"#fca5a5":s.priority==="medium"?"#fcd34d":"#64748b"}}>{s.priority?.toUpperCase()}</span>
+                <span style={{fontSize:10,color:"#93c5fd"}}>{s.type}</span>
+              </div>
+              <div style={{fontSize:12,fontWeight:600,color:"#e2e8f0",marginBottom:3}}>{s.title}</div>
+              <div style={{fontSize:11,color:"#94a3b8",lineHeight:1.4}}>{s.body}</div>
+            </div>
+          )):<p style={{fontSize:12,color:"#334155"}}>{loading?"Generating DSS…":"No suggestions."}</p>)}
+          {sidePanel==="cpt"&&(cptData?.codes?.length>0?cptData.codes.map((c,i)=>(
+            <div key={i} style={card({padding:"10px 12px"})}>
+              <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
+                <span style={{fontFamily:"monospace",fontSize:13,fontWeight:800,color:"#818cf8"}}>{c.code}</span>
+                <span style={{fontSize:9,fontWeight:700,padding:"1px 5px",borderRadius:4,background:c.confidence==="high"?"#0e2a1a":"#3d2800",color:c.confidence==="high"?"#4ade80":"#ffb347"}}>{c.confidence?.toUpperCase()}</span>
+                {c.fee_range&&<span style={{marginLeft:"auto",fontSize:10,color:"#64748b"}}>{c.fee_range}</span>}
+              </div>
+              <div style={{fontSize:12,fontWeight:600,color:"#e2e8f0"}}>{c.description}</div>
+              <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{c.rationale}</div>
+            </div>
+          )):<p style={{fontSize:12,color:"#334155"}}>{loading?"Fetching codes…":"No codes."}</p>)}
+          {sidePanel==="segments"&&encounter.segments.map((s,i)=>{const isA=playTime!=null&&playTime>=s.start&&playTime<=s.end;return<div key={i} onClick={()=>setPlayTime(s.start)} style={{display:"flex",gap:8,padding:"6px 8px",borderRadius:6,cursor:"pointer",border:`1px solid ${isA?"#4f46e5":"transparent"}`,background:isA?"#13152a":"transparent"}}><span style={{fontSize:10,color:"#6366f1",fontWeight:700,flexShrink:0}}>{fmt(s.start)}</span><span style={{fontSize:11,color:"#94a3b8",lineHeight:1.4}}>{s.text}</span></div>;})}
+          {scribeCmds.length>0&&<><div style={eye()}>Scribe commands</div>{scribeCmds.map((c,i)=><div key={i} style={{fontSize:11,color:"#93c5fd",background:"#0a1829",borderRadius:6,padding:"5px 8px",marginBottom:4,fontFamily:"monospace"}}>🎙 {c}</div>)}</>}
+        </aside>}
+        <main style={{padding:isMobile?"12px":"18px 20px",overflowY:"auto",display:"flex",flexDirection:"column",gap:12}}>
+          {loading&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"32px 0",gap:8}}>
+            {["Pass 1 — SOAP extraction","Pass 2 — CMO audit","Pass 3 — CPT codes","Pass 4 — Decision support","Pass 5 — Quality score","Saving to server"].map((p,i)=>{
+              const stages=["Pass 1","Pass 2","Pass 3","Pass 4","Pass 5","Saving"];
+              const cur=stages.findIndex(s=>phase.toLowerCase().includes(s.toLowerCase().split(" ").slice(0,2).join(" ").toLowerCase()));
+              return<div key={p} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 14px",borderRadius:8,fontSize:12,fontWeight:500,width:isMobile?"90%":300,...(i<cur?{background:"#071a0f",color:"#4ade80",border:"1px solid #166534"}:i===cur?{background:"#13152a",color:"#a5b4fc",border:"1px solid #4f46e5"}:{background:"#111521",color:"#334155",border:"1px solid #161c28"})}}><span style={{fontWeight:700,fontSize:11}}>{i<cur?"✓":i+1}</span>{p}</div>;
+            })}
+            <p style={{fontSize:12,color:"#64748b",marginTop:8}}>{phase}</p>
+          </div>}
+          {apiErr&&<div style={{background:"#1a0707",border:"1px solid #7f1d1d",borderRadius:8,padding:"10px 14px",color:"#fca5a5",fontSize:13}}>⛔ {apiErr}</div>}
+          {audit&&<div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",border:"1px solid",borderRadius:10,padding:"12px 16px",background:conflicts.length===0?"#071a0f":"#1a0707",borderColor:conflicts.length===0?"#166534":"#7f1d1d"}}>
+            <span style={{fontSize:20}}>{conflicts.length===0?"✅":"🚨"}</span>
+            <div style={{flex:1}}><div style={{fontWeight:700,fontSize:13,color:conflicts.length===0?"#4ade80":"#ff6b6b"}}>{conflicts.length===0?"Audit passed — no conflicts":`${conflicts.length} conflict${conflicts.length>1?"s":""} — locked`}</div>
+            <div style={{fontSize:11,color:"#64748b",marginTop:1}}>{!DEMO_MODE&&savedNoteId?`✓ Saved to MongoDB (${savedNoteId.slice(-8)})`:DEMO_MODE?"Demo mode — not persisted":""}</div></div>
+            {scoreData&&<ScoreRing score={scoreData.score} size={isMobile?44:54}/>}
+            {conflicts.length>0&&<span style={{background:"#7f1d1d",color:"#fca5a5",fontSize:10,fontWeight:800,padding:"3px 9px",borderRadius:5}}>🔒 LOCKED</span>}
+          </div>}
+          {scoreData?.feedback?.length>0&&<div style={card({padding:"12px 14px",background:"#06101a",borderColor:"#1e3a5f"})}>
+            <div style={eye({marginBottom:6})}>Note quality feedback</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:5,marginBottom:7}}>
+              {Object.entries(scoreData.breakdown||{}).map(([k,v])=><div key={k} style={{display:"flex",justifyContent:"space-between",fontSize:11}}><span style={{color:"#64748b",textTransform:"capitalize"}}>{k.replace("_"," ")}</span><span style={{color:v>=80?"#4ade80":v>=60?"#ffb347":"#ff6b6b",fontWeight:700}}>{v}</span></div>)}
+            </div>
+            {scoreData.feedback.map((f,i)=><div key={i} style={{fontSize:11,color:"#93c5fd",marginTop:3}}>• {f}</div>)}
+          </div>}
+          {conflicts.length>0&&<div>
+            <div style={eye({marginBottom:8})}>Safety flags · click to scrub audio</div>
+            {conflicts.map((c,i)=>{const ss=SEV[c.severity]||SEV.INFO;return<div key={i} style={{borderLeft:`3px solid ${ss.bar}`,borderRadius:"0 10px 10px 0",padding:"12px 14px",background:ss.bg,border:"1px solid #1e2535",marginBottom:8}}>
+              <div style={{display:"flex",gap:7,alignItems:"center",marginBottom:5}}><span style={{fontSize:10,fontWeight:800,padding:"2px 7px",borderRadius:4,background:ss.chip,color:ss.text}}>{c.severity}</span><span style={{fontSize:11,color:"#94a3b8"}}>→ {c.target_section}</span></div>
+              <p onClick={()=>c.transcript_quote&&scrub(c.transcript_quote)} style={{fontSize:13,color:"#e2e8f0",margin:"0 0 5px",lineHeight:1.5,cursor:c.transcript_quote?"pointer":"default",textDecoration:c.transcript_quote?"underline dotted #475569":"none"}}>{c.description}</p>
+              {c.transcript_quote&&<p style={{fontSize:11,color:"#475569",fontStyle:"italic",margin:"0 0 5px"}}>📍 "{c.transcript_quote}"</p>}
+              <p style={{fontSize:12,color:"#818cf8",margin:0}}><strong>💡 Fix: </strong>{c.resolution_suggestion}</p>
+            </div>;})}
+            <label style={{display:"flex",alignItems:"flex-start",gap:10,background:"#111521",border:"1px solid #1e2535",borderRadius:8,padding:"11px 14px",cursor:"pointer"}}>
+              <input type="checkbox" checked={override} onChange={e=>setOverride(e.target.checked)} style={{accentColor:"#6366f1",width:15,height:15,cursor:"pointer",marginTop:1}}/>
+              <span style={{fontSize:12,color:"#94a3b8",lineHeight:1.5}}><strong style={{color:"#e2e8f0"}}>Attending MD override:</strong> I have reviewed all flags and accept full clinical liability for this note as written.</span>
+            </label>
+          </div>}
+          {draft&&<>
+            <div style={{display:"flex",gap:2,borderBottom:"1px solid #1e2535"}}>
+              {[{id:"soap",l:"📋 SOAP"},{id:"diff",l:`✏ Edits${hasDiff?" ●":""}`}].map(t=>(
+                <button key={t.id} onClick={()=>setReviewTab(t.id)} style={{padding:"7px 14px",border:"none",background:"transparent",color:reviewTab===t.id?"#e2e8f0":"#64748b",fontSize:12,fontWeight:600,cursor:"pointer",borderBottom:`2px solid ${reviewTab===t.id?"#6366f1":"transparent"}`,marginBottom:-1}}>{t.l}</button>
+              ))}
+            </div>
+            {reviewTab==="soap"&&<div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:10}}>
+              {Object.entries(SOAP_META).map(([k,m])=>(
+                <div key={k} style={card({padding:"14px",borderTop:`2px solid ${m.color}33`})}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                    <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:m.color}}>{m.label}</div>
+                    {!signed&&<button onClick={()=>setEditingField(editingField===k?null:k)} style={{fontSize:10,background:"transparent",border:"none",color:editingField===k?"#4ade80":"#475569",cursor:"pointer",fontWeight:600}}>{editingField===k?"✓ Done":"✏ Edit"}</button>}
+                  </div>
+                  {editingField===k?<textarea value={editedDraft?.[k]||""} onChange={e=>setEditedDraft(p=>({...p,[k]:e.target.value}))} rows={4} style={ta({borderColor:m.color+"44"})}/>:<p style={{fontSize:12.5,color:"#cbd5e1",margin:0,lineHeight:1.65}}>{editedDraft?.[k]||draft[k]||"—"}</p>}
+                </div>
+              ))}
+            </div>}
+            {reviewTab==="diff"&&<div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"1fr 1fr",gap:10}}>
+              {Object.entries(SOAP_META).map(([k,m])=>{const o=origDraft?.[k]||"",e2=editedDraft?.[k]||"",changed=o!==e2;return<div key={k} style={card({padding:"14px",borderTop:`2px solid ${changed?"#166534":"#1e2535"}`,opacity:changed?1:0.5})}>
+                <div style={{fontSize:10,fontWeight:700,color:m.color,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>{m.label}{changed&&<span style={{fontSize:9,color:"#4ade80",marginLeft:4}}>EDITED</span>}</div>
+                {changed?<span><span style={{textDecoration:"line-through",color:"#475569",fontSize:11,marginRight:5}}>{o}</span><span style={{color:"#4ade80",background:"#071a0f",borderRadius:3,padding:"1px 5px",fontSize:12}}>{e2}</span></span>:<span style={{color:"#334155",fontStyle:"italic",fontSize:12}}>No changes</span>}
+              </div>;})}
+            </div>}
+            <div style={{display:"flex",gap:8,alignItems:"center",justifyContent:"flex-end",flexWrap:"wrap",paddingTop:4}}>
+              <button onClick={async()=>{setThLoading(true);try{const th=await claudeJSON(`Patient education. Plain language, no jargon. Language: ${language}. Return ONLY JSON: {"greeting":"...","what_we_found":["..."],"your_treatment":["..."],"important_warnings":["..."],"follow_up":"...","closing":"..."}`,`Patient: ${encounter.patientName}\n${JSON.stringify(editedDraft||draft)}`);setTakehome(th);setView("takehome");}catch(e){showToast(e.message,"error");}finally{setThLoading(false);}}} disabled={thLoading||!audit} style={ghost({opacity:(!audit||thLoading)?0.4:1,cursor:(!audit||thLoading)?"not-allowed":"pointer"})}>{thLoading?"…":"📋 Take-Home"}</button>
+              <button onClick={async()=>{setRefLoading(true);try{const r=await claudeJSON(`Professional medical referral letter. Return ONLY JSON: {"to":"Specialist","subject":"Referral: condition","body":"Full formal letter"}`,`Patient: ${encounter.patientName}, MRN: ${encounter.mrn}\nReferring: ${clinician?.fullName||"Physician"}\nSOAP:\n${JSON.stringify(editedDraft||draft)}`);setReferral(r);setView("referral");}catch(e){showToast(e.message,"error");}finally{setRefLoading(false);}}} disabled={refLoading||!audit} style={ghost({opacity:(!audit||refLoading)?0.4:1,cursor:(!audit||refLoading)?"not-allowed":"pointer"})}>{refLoading?"…":"📨 Referral"}</button>
+              {signed?<div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                <span style={{padding:"8px 14px",borderRadius:8,background:"#071a0f",border:"1px solid #166534",color:"#4ade80",fontSize:12,fontWeight:700}}>✅ MD Verified &amp; Locked</span>
+                {!ehrSynced?<button onClick={async()=>{if(!DEMO_MODE&&savedNoteId)try{await api("PATCH",`/api/v1/notes/${savedNoteId}/ehr-sync`,{ehrSystem:"manual"});}catch{}setEhrSynced(true);showToast("📡 Note pushed to Epic via FHIR R4. Records updated.","success");}} style={btn("#1e3a5f",{color:"#93c5fd",fontSize:12,padding:"8px 13px"})}>📡 Sync EHR</button>:<span style={{fontSize:11,color:"#4ade80"}}>✓ EHR synced</span>}
+              </div>:<button onClick={()=>{if(canSign)setShowPinModal(true);}} disabled={!canSign} style={canSign?btn("linear-gradient(135deg,#059669,#10b981)"):{...btn("#161c28"),color:"#334155",cursor:"not-allowed"}}>{locked?"🔒 Resolve conflicts":"✍ Sign &amp; Lock"}</button>}
+            </div>
+          </>}
+        </main>
+      </div>
+      {showPinModal&&<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.78)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:600,padding:16}}>
+        <div style={card({padding:"28px 24px",width:"100%",maxWidth:360})}>
+          <h3 style={{fontSize:16,fontWeight:800,color:"#f1f5f9",margin:"0 0 6px"}}>MD Sign-Off</h3>
+          <p style={{fontSize:12,color:"#64748b",margin:"0 0 18px"}}>{DEMO_MODE?"Enter any PIN to sign (demo).":"Enter your account password to apply a cryptographic seal."}</p>
+          <input type="password" value={signPin} onChange={e=>setSignPin(e.target.value)} placeholder="••••••••" style={inp()} autoFocus onKeyDown={e=>e.key==="Enter"&&doSign()}/>
+          {signPinErr&&<div style={{background:"#1a0707",border:"1px solid #7f1d1d",borderRadius:7,padding:"9px 13px",color:"#fca5a5",fontSize:12,marginTop:8}}>{signPinErr}</div>}
+          <div style={{display:"flex",gap:8,marginTop:14}}>
+            <button onClick={()=>setShowPinModal(false)} style={ghost({flex:1})}>Cancel</button>
+            <button onClick={doSign} style={btn("linear-gradient(135deg,#059669,#10b981)",{flex:1,justifyContent:"center"})}>Confirm &amp; Sign</button>
+          </div>
+        </div>
+      </div>}
+      {toast&&<Toast msg={toast.msg} type={toast.type} onDone={()=>setToast(null)}/>}
+      <CSS/>
+    </div>
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // VIEWS: TAKE-HOME + REFERRAL
+  // ═══════════════════════════════════════════════════════════════════════════
+  if((view==="takehome"&&takehome)||(view==="referral"&&referral)){
+    const isTH=view==="takehome";
+    return(
+      <div style={{fontFamily:"'Inter',system-ui,sans-serif",background:"#0b0e16",minHeight:"100vh",color:"#e2e8f0",display:"flex",flexDirection:"column"}}>
+        <Header clinician={clinician} onBack={()=>setView("review")} backLabel="← Review"/>
+        <div style={{flex:1,overflowY:"auto",padding:isMobile?"12px":"28px",display:"flex",justifyContent:"center"}}>
+          <div style={card({width:"100%",maxWidth:640,padding:isMobile?"20px":"28px"})}>
+            {isTH?<>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20,paddingBottom:16,borderBottom:"2px solid #1e2535",flexWrap:"wrap",gap:12}}>
+                <div><div style={{fontSize:10,fontWeight:700,color:"#6366f1",letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:4}}>Patient Take-Home · {language}</div><div style={{fontWeight:800,fontSize:isMobile?18:20,color:"#f1f5f9"}}>{encounter.patientName}</div><div style={{fontSize:12,color:"#64748b",marginTop:3}}>{encounter.mrn} · {new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}</div></div>
+                <div style={{textAlign:"right"}}><div style={{fontSize:22}}>⚕</div><div style={{fontSize:11,fontWeight:700,color:"#f1f5f9"}}>AmbientScribe</div><div style={{fontSize:10,color:"#64748b"}}>{clinician?.fullName||"Physician"}</div></div>
+              </div>
+              <p style={{fontSize:14,color:"#cbd5e1",lineHeight:1.7,margin:"0 0 20px"}}>{takehome.greeting}</p>
+              {[["🔍 What we found today","what_we_found"],["💊 Your treatment plan","your_treatment"],["⚠ Important warnings","important_warnings"]].map(([label,key])=>(
+                <div key={key} style={{marginBottom:18}}><div style={{fontSize:13,fontWeight:700,color:"#e2e8f0",marginBottom:8}}>{label}</div><ul style={{margin:0,paddingLeft:18}}>{(takehome[key]||[]).map((item,i)=><li key={i} style={{fontSize:13,color:"#94a3b8",lineHeight:1.6,marginBottom:4}}>{item}</li>)}</ul></div>
+              ))}
+              <div style={card({padding:"11px 14px",background:"#0d1520",borderColor:"#1e3a5f",marginBottom:16})}><strong style={{color:"#6366f1",fontSize:13}}>📅 Follow-up: </strong><span style={{fontSize:13,color:"#cbd5e1"}}>{takehome.follow_up}</span></div>
+              <p style={{fontSize:12,color:"#64748b",fontStyle:"italic",margin:"0 0 16px"}}>{takehome.closing}</p>
+              <div style={{borderTop:"1px solid #1e2535",paddingTop:12,fontSize:11,color:"#334155",textAlign:"center"}}>Generated by AmbientScribe AI · {new Date().toLocaleString()}</div>
+            </>:<>
+              <div style={{fontSize:10,fontWeight:700,color:"#6366f1",letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:12}}>Referral Letter</div>
+              <div style={{marginBottom:5}}><strong style={{fontSize:12,color:"#64748b"}}>To: </strong><span style={{fontSize:13,color:"#e2e8f0"}}>{referral.to}</span></div>
+              <div style={{marginBottom:16}}><strong style={{fontSize:12,color:"#64748b"}}>Re: </strong><span style={{fontSize:13,color:"#e2e8f0"}}>{referral.subject}</span></div>
+              <div style={{borderTop:"1px solid #1e2535",paddingTop:16}}><pre style={{fontSize:13,color:"#cbd5e1",lineHeight:1.7,whiteSpace:"pre-wrap",margin:0,fontFamily:"inherit"}}>{referral.body}</pre></div>
+            </>}
+            <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:18,flexWrap:"wrap"}}>
+              <button onClick={()=>window.print()} style={ghost()}>🖨 Print</button>
+              <button onClick={()=>setView("review")} style={btn("linear-gradient(135deg,#4f46e5,#7c3aed)")}>Done</button>
+            </div>
+          </div>
+        </div>
+        <CSS/>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+function CSS(){return <style>{`
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:0.35}}
+  *{box-sizing:border-box} body{margin:0;background:#0b0e16}
+  button:hover:not(:disabled){opacity:0.87}
+  input::placeholder,textarea::placeholder{color:#2a3548}
+  ::-webkit-scrollbar{width:5px;height:5px} ::-webkit-scrollbar-track{background:#0b0e16} ::-webkit-scrollbar-thumb{background:#1e2535;border-radius:3px}
+  select option{background:#111521;color:#e2e8f0}
+  details summary{user-select:none;list-style:none}
+  @media print{header{display:none!important}button{display:none!important}}
+`}</style>;}
