@@ -10,7 +10,7 @@ const {
   protect,
   recordFailedAttempt,
   resetLoginAttempts,
-}                = require('./middleware/auth');
+}                = require('./middleware_auth');
 
 const router = express.Router();
 
