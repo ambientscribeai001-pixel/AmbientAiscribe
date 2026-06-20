@@ -5,7 +5,7 @@
 const express    = require('express');
 const jwt        = require('jsonwebtoken');
 const rateLimit  = require('express-rate-limit');
-const User       = require('./middleware_User');
+const User       = require('./User');
 const {
   protect,
   recordFailedAttempt,
